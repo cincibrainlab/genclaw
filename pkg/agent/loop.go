@@ -541,6 +541,9 @@ func (al *AgentLoop) Run(ctx context.Context) error {
 				continue
 			}
 			al.HandleInbound(ctx, msg)
+			if msg.Cleanup != nil {
+				msg.Cleanup()
+			}
 		}
 	}
 
