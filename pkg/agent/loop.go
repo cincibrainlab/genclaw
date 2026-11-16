@@ -1719,7 +1719,10 @@ Either call the appropriate tool now, or give an honest present-tense status of 
 
 			toolStartedAt := time.Now()
 			toolResult := al.tools.ExecuteWithContext(ctx, tc.Name, tc.Arguments, opts.Channel, opts.ChatID, asyncCallback)
-			toolResult = tools.LimitGiteaProjectListResult(tc.Name, tc.Arguments, toolResult, al.toolResultLLMCharLimit())
+			toolResult, bounded := tools.PrepareGiteaMCPResult(al.tools, tc.Name, toolResult, al.toolResultLLMCharLimit())
+			if !bounded {
+				toolResult = tools.LimitGiteaProjectListResult(tc.Name, tc.Arguments, toolResult, al.toolResultLLMCharLimit())
+			}
 			toolNamesExecuted = append(toolNamesExecuted, tc.Name)
 			if toolResult.Async {
 				asyncToolUsed = true
@@ -1770,7 +1773,9 @@ Either call the appropriate tool now, or give an honest present-tense status of 
 			if contentForLLM == "" && toolResult.Err != nil {
 				contentForLLM = toolResult.Err.Error()
 			}
-			contentForLLM = truncateWithNotice(contentForLLM, al.toolResultLLMCharLimit(), "tool output")
+			if !bounded {
+				contentForLLM = truncateWithNotice(contentForLLM, al.toolResultLLMCharLimit(), "tool output")
+			}
 			if localDiag != nil {
 				toolFields := map[string]interface{}{
 					"turn_id":        opts.TurnID,

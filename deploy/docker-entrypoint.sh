@@ -2,7 +2,7 @@
 set -eu
 
 mkdir -p /root/sciclaw/skills
-for skill in gitea-create-change-request gitea-move-work-item gitea-move-file-phase-0-to-1; do
+for skill in gitea-create-change-request gitea-move-work-item gitea-move-file-phase-0-to-1 gitea-read-file; do
   dir="/root/sciclaw/skills/$skill"
   if [ ! -f "/opt/sciclaw/skills/$skill/SKILL.md" ]; then
     echo "Warning: bundled skill $skill is unavailable; skipping seeding and preserving any workspace copy." >&2

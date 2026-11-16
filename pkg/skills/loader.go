@@ -29,7 +29,7 @@ type SkillsLoader struct {
 	managedGiteaSkills string
 }
 
-var managedGiteaNames = []string{"gitea-create-change-request", "gitea-move-work-item", "gitea-move-file-phase-0-to-1"}
+var managedGiteaNames = []string{"gitea-create-change-request", "gitea-move-work-item", "gitea-move-file-phase-0-to-1", "gitea-read-file"}
 
 func (sl *SkillsLoader) isManagedGitea(name string) bool {
 	if sl.managedGiteaSkills == "" {

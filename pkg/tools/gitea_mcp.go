@@ -151,7 +151,9 @@ func (t *GiteaMCPTool) Execute(ctx context.Context, args map[string]interface{})
 		arguments["page"] = 1
 	}
 	var all []json.RawMessage
+	var pageOutputs strings.Builder
 	seen := make(map[string]bool)
+	writeCall := strings.HasSuffix(name, "_write") || slices.Contains([]string{"create_organization", "create_or_update_file", "delete_file"}, name)
 	for pageNumber := 1; ; pageNumber++ {
 		input, err := json.Marshal(arguments)
 		if err != nil {
@@ -181,26 +183,47 @@ func (t *GiteaMCPTool) Execute(ctx context.Context, args map[string]interface{})
 		if localUpload {
 			return localPathUploadResult(stdout.Bytes(), arguments, waitErr)
 		}
+		if paginate {
+			if pageOutputs.Len() > 0 {
+				pageOutputs.WriteByte('\n')
+			}
+			pageOutputs.Write(stdout.Bytes())
+		}
 		if err := waitErr; err != nil {
 			detail := strings.TrimSpace(stderr.String())
-			if detail == "" {
-				detail = strings.TrimSpace(stdout.String())
+			output := stdout.String()
+			if paginate {
+				output = pageOutputs.String()
 			}
+			if detail != "" && output != "" {
+				detail += "\n"
+			}
+			detail += output
 			var response struct {
 				IsError bool `json:"isError"`
 			}
 			explicitError := json.Unmarshal(stdout.Bytes(), &response) == nil && response.IsError
-			if strings.HasSuffix(name, "_write") || slices.Contains([]string{
-				"create_organization", "create_or_update_file", "delete_file",
-			}, name) {
+			if writeCall {
 				if explicitError {
 					return ErrorResult(fmt.Sprintf("Gitea MCP write reported an error. Reconcile remote state before retrying; the write may have caused side effects.\n%v\n%s", err, detail))
 				}
 				return ErrorResult(fmt.Sprintf("Gitea MCP write outcome is unknown. Reconcile remote state before retrying; the write may have succeeded.\n%v\n%s", err, detail))
 			}
+			if paginate {
+				return ErrorResult(fmt.Sprintf("Gitea MCP pagination failed; results are incomplete: %v\n%s", err, detail))
+			}
 			return ErrorResult(fmt.Sprintf("Gitea MCP call failed: %v\n%s", err, detail))
 		}
 		if !paginate {
+			var response struct {
+				IsError bool `json:"isError"`
+			}
+			if json.Unmarshal(stdout.Bytes(), &response) == nil && response.IsError {
+				if writeCall {
+					return ErrorResult("Gitea MCP write reported an error. Reconcile remote state before retrying; the write may have caused side effects.\n" + stdout.String())
+				}
+				return ErrorResult(stdout.String())
+			}
 			return NewToolResult(stdout.String())
 		}
 		var result struct {
@@ -211,17 +234,17 @@ func (t *GiteaMCPTool) Execute(ctx context.Context, args map[string]interface{})
 			IsError bool `json:"isError"`
 		}
 		if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
-			return ErrorResult("invalid Gitea MCP pagination response")
+			return ErrorResult("invalid Gitea MCP pagination response; results are incomplete:\n" + pageOutputs.String())
 		}
 		if result.IsError {
-			return ErrorResult("Gitea MCP pagination call failed: " + stdout.String())
+			return ErrorResult("Gitea MCP pagination call failed; results are incomplete:\n" + pageOutputs.String())
 		}
 		if len(result.Content) != 1 || result.Content[0].Type != "text" {
-			return ErrorResult("invalid Gitea MCP pagination response")
+			return ErrorResult("invalid Gitea MCP pagination response; results are incomplete:\n" + pageOutputs.String())
 		}
 		var page []json.RawMessage
 		if err := json.Unmarshal([]byte(result.Content[0].Text), &page); err != nil || page == nil {
-			return ErrorResult("invalid Gitea MCP pagination results")
+			return ErrorResult("invalid Gitea MCP pagination results; results are incomplete:\n" + pageOutputs.String())
 		}
 		if len(page) == 0 {
 			if all == nil {
@@ -235,7 +258,7 @@ func (t *GiteaMCPTool) Execute(ctx context.Context, args map[string]interface{})
 		// A server that ignores page can otherwise return the same data indefinitely.
 		pageJSON, _ := json.Marshal(page)
 		if seen[string(pageJSON)] {
-			return ErrorResult("Gitea MCP pagination returned a repeated page; results may be incomplete")
+			return ErrorResult("Gitea MCP pagination returned a repeated page; results may be incomplete:\n" + pageOutputs.String())
 		}
 		seen[string(pageJSON)] = true
 		all = append(all, page...)

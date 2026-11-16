@@ -155,14 +155,19 @@ func RunToolLoop(ctx context.Context, config ToolLoopConfig, messages []provider
 				toolResult = ErrorResult("No tools available")
 			}
 
-			toolResult = LimitGiteaProjectListResult(tc.Name, tc.Arguments, toolResult, config.ToolResultMaxChars)
+			toolResult, bounded := PrepareGiteaMCPResult(config.Tools, tc.Name, toolResult, config.ToolResultMaxChars)
+			if !bounded {
+				toolResult = LimitGiteaProjectListResult(tc.Name, tc.Arguments, toolResult, config.ToolResultMaxChars)
+			}
 
 			// Determine content for LLM
 			contentForLLM := toolResult.ForLLM
 			if contentForLLM == "" && toolResult.Err != nil {
 				contentForLLM = toolResult.Err.Error()
 			}
-			contentForLLM = truncateToolLoopContent(contentForLLM, config.ToolResultMaxChars, "tool output")
+			if !bounded {
+				contentForLLM = truncateToolLoopContent(contentForLLM, config.ToolResultMaxChars, "tool output")
+			}
 
 			// Add tool result message
 			toolResultMsg := providers.Message{

@@ -5,7 +5,7 @@ description: Move one AtomicQMS/Gitea repository task file from phase_0 to the m
 
 # Move Gitea File From Phase 0 To Phase 1
 
-Use the `atomicqms_mcp` tool for every call to the configured official Gitea MCP server. Set `tool` to the MCP tool name and `arguments` to a JSON object containing its arguments. Never use `exec` or construct shell commands. The CLI reads `SCICLAW_MCP_URL`; never include credentials in arguments, chat messages, or logs. This requires the standalone CLI with stdin support (sciclaw-mcp-cli PR #2) installed by the service packaging (sciclaw-stack #12); the older bundled CLI does not support this invocation.
+Use the `atomicqms_mcp` tool for every call to the configured official Gitea MCP server. Set `tool` to the MCP tool name and `arguments` to a JSON object containing its arguments. Never use `exec` or shell commands for remote MCP calls; local-only decoding and extraction may use `exec` as described in `gitea-read-file`. The CLI reads `SCICLAW_MCP_URL`; never include credentials in arguments, chat messages, or logs. This requires the standalone CLI with stdin support (sciclaw-mcp-cli PR #2) installed by the service packaging (sciclaw-stack #12); the older bundled CLI does not support this invocation.
 
 Collect `owner`, `repository`, `branch`, and the exact repository-relative `filePath`. Require `filePath` to start with `phase_0/` and identify one file, not a directory. Reject backslashes, empty path segments, `.`, and `..`.
 

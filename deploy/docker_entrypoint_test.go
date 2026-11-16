@@ -22,7 +22,7 @@ func TestDockerEntrypointPreservesWorkspaceSkills(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	skills := []string{"gitea-create-change-request", "gitea-move-work-item", "gitea-move-file-phase-0-to-1"}
+	skills := []string{"gitea-create-change-request", "gitea-move-work-item", "gitea-move-file-phase-0-to-1", "gitea-read-file"}
 	for _, skill := range skills {
 		write(filepath.Join(builtin, skill, "SKILL.md"), "built-in", 0644)
 	}
@@ -69,6 +69,7 @@ func TestDockerEntrypointPreservesWorkspaceSkills(t *testing.T) {
 			filepath.Join(workspace, skills[1], "SKILL.md"):                seededWant,
 			filepath.Join(workspace, skills[1], "extra.txt"):               "keep",
 			filepath.Join(workspace, skills[2], "SKILL.md"):                "built-in",
+			filepath.Join(workspace, skills[3], "SKILL.md"):                "built-in",
 			filepath.Join(workspace, "move-task-phase-0-to-1", "SKILL.md"): "legacy",
 			filepath.Join(tmp, "args"):                                     "gateway\n--test\n",
 		} {
