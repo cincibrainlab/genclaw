@@ -29,14 +29,14 @@ func (t *GiteaMCPTool) SetSharedWorkspacePolicy(workspace string, readOnly bool)
 var giteaMCPTools = []string{
 	"get_me",
 	"get_user_orgs",
+	"create_organization",
 	"actions_config_read",
 	"actions_run_read",
 	"actions_config_write",
 	"actions_run_write",
 	"repo_read",
 	"get_repository_tree",
-	"create_repo",
-	"fork_repo",
+	"repo_write",
 	"notification_read",
 	"notification_write",
 	"list_issues",
@@ -68,16 +68,13 @@ var giteaMCPTools = []string{
 	"create_or_update_file",
 	"delete_file",
 	"branch_read",
-	"create_branch",
-	"delete_branch",
-	"rename_branch",
+	"branch_write",
 	"tag_read",
-	"create_tag",
-	"delete_tag",
+	"tag_write",
 	"commit_read",
+	"commit_write",
 	"release_read",
-	"create_release",
-	"delete_release",
+	"release_write",
 }
 
 // LimitGiteaProjectListResult prevents partial project lists from reaching an agent.
@@ -194,7 +191,7 @@ func (t *GiteaMCPTool) Execute(ctx context.Context, args map[string]interface{})
 			}
 			explicitError := json.Unmarshal(stdout.Bytes(), &response) == nil && response.IsError
 			if strings.HasSuffix(name, "_write") || slices.Contains([]string{
-				"create_repo", "fork_repo", "create_or_update_file", "delete_file", "create_branch", "delete_branch", "rename_branch", "create_tag", "delete_tag", "create_release", "delete_release",
+				"create_organization", "create_or_update_file", "delete_file",
 			}, name) {
 				if explicitError {
 					return ErrorResult(fmt.Sprintf("Gitea MCP write reported an error. Reconcile remote state before retrying; the write may have caused side effects.\n%v\n%s", err, detail))

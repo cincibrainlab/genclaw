@@ -11,55 +11,64 @@ import (
 	"time"
 )
 
-// Read inventory from gitea-mcp v1.13.0, with the existing write inventory preserved.
+// Exact tool inventory from gitea-mcp v1.13.0.
 func TestGiteaMCPToolInventory(t *testing.T) {
-	want := strings.Fields(`get_gitea_mcp_server_version get_me get_user_orgs search_users search_org_teams search_repos search_issues notification_read label_read milestone_read wiki_read timetracking_read package_read project_read list_issues issue_read list_pull_requests pull_request_read actions_config_read actions_run_read repo_read get_repository_tree get_file_contents get_dir_contents branch_read tag_read commit_read release_read`)
-	stale := strings.Fields(`list_my_repos list_org_repos attachment_read list_branches get_tag list_tags list_commits get_commit get_release get_latest_release list_releases`)
+	want := strings.Fields(`get_gitea_mcp_server_version get_me get_user_orgs search_users search_org_teams search_repos search_issues notification_read label_read milestone_read wiki_read timetracking_read package_read project_read list_issues issue_read list_pull_requests pull_request_read actions_config_read actions_run_read repo_read get_repository_tree get_file_contents get_dir_contents branch_read tag_read commit_read release_read actions_config_write actions_run_write create_organization repo_write notification_write issue_write label_write milestone_write package_write pull_request_write pull_request_review_write project_write wiki_write timetracking_write create_or_update_file delete_file branch_write tag_write commit_write release_write`)
+	stale := strings.Fields(`list_my_repos list_org_repos attachment_read list_branches get_tag list_tags list_commits get_commit get_release get_latest_release list_releases create_repo fork_repo create_branch delete_branch rename_branch create_tag delete_tag create_release delete_release unknown`)
 	tool := &GiteaMCPTool{}
 	if got := tool.Name(); got != "atomicqms_mcp" {
 		t.Fatalf("tool name = %q, want atomicqms_mcp", got)
 	}
 	properties := tool.Parameters()["properties"].(map[string]interface{})
 	got := properties["tool"].(map[string]interface{})["enum"].([]string)
-	allowed := append(slices.Clone(want), strings.Fields(`actions_config_write actions_run_write create_repo fork_repo notification_write issue_write label_write milestone_write package_write pull_request_write pull_request_review_write project_write wiki_write timetracking_write create_or_update_file delete_file create_branch delete_branch rename_branch create_tag delete_tag create_release delete_release`)...)
 	seen := map[string]bool{}
 	for _, name := range got {
 		if seen[name] {
 			t.Errorf("duplicate tool %q", name)
 		}
 		seen[name] = true
-		if !slices.Contains(allowed, name) {
+		if !slices.Contains(want, name) {
 			t.Errorf("unexpected tool %q", name)
 		}
 	}
-	for _, name := range allowed {
+	for _, name := range want {
 		if !seen[name] {
 			t.Errorf("allowed tool %q missing from enum", name)
 		}
 	}
 	dir := t.TempDir()
-	script := "#!/usr/bin/python3\nimport sys\nassert len(sys.argv) == 4 and sys.argv[1] == 'call' and sys.argv[3] == '--stdin'\nsys.stdout.write(sys.argv[2])\n"
+	marker := filepath.Join(dir, "invoked")
+	t.Setenv("INVOCATION_MARKER", marker)
+	script := "#!/usr/bin/python3\nimport os, sys\nassert len(sys.argv) == 4 and sys.argv[1] == 'call' and sys.argv[3] == '--stdin'\nopen(os.environ['INVOCATION_MARKER'], 'a').write(sys.argv[2] + '\\n')\nsys.stdout.write(sys.argv[2])\n"
 	if err := os.WriteFile(filepath.Join(dir, "mcp-server-cli"), []byte(script), 0755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", dir)
 	for _, name := range want {
 		if !slices.Contains(got, name) {
-			t.Errorf("current read tool %q missing from enum", name)
+			t.Errorf("current tool %q missing from enum", name)
 		}
 		result := tool.Execute(context.Background(), map[string]interface{}{"tool": name, "arguments": map[string]interface{}{}})
 		if result.IsError || result.ForLLM != name {
 			t.Errorf("%s: %#v", name, result)
 		}
 	}
+	before, err := os.ReadFile(marker)
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, name := range stale {
 		if slices.Contains(got, name) {
-			t.Errorf("stale read tool %q present in enum", name)
+			t.Errorf("stale tool %q present in enum", name)
 		}
 		result := tool.Execute(context.Background(), map[string]interface{}{"tool": name, "arguments": map[string]interface{}{}})
 		if !result.IsError {
-			t.Errorf("stale read tool %q accepted: %#v", name, result)
+			t.Errorf("stale tool %q accepted: %#v", name, result)
 		}
+	}
+	after, err := os.ReadFile(marker)
+	if err != nil || string(after) != string(before) {
+		t.Fatalf("rejected names invoked CLI: %v", err)
 	}
 }
 
@@ -299,6 +308,11 @@ func TestGiteaMCPWriteFailures(t *testing.T) {
 		reconcile    bool
 	}{
 		{"#!/bin/sh\necho transport-failed >&2\nexit 1\n", "pull_request_write", true, true},
+		{"#!/bin/sh\necho transport-failed >&2\nexit 1\n", "create_organization", true, true},
+		{"#!/bin/sh\necho '{\"isError\":true,\"content\":[]}'\nexit 1\n", "create_organization", false, true},
+		{"#!/bin/sh\necho transport-failed >&2\nexit 1\n", "repo_write", true, true},
+		{"#!/bin/sh\necho transport-failed >&2\nexit 1\n", "delete_file", true, true},
+		{"#!/bin/sh\necho transport-failed >&2\nexit 1\n", "create_or_update_file", true, true},
 		{"#!/bin/sh\necho transport-failed >&2\nexit 1\n", "issue_read", false, false},
 		{"#!/bin/sh\necho '{\"isError\":true,\"content\":[]}'\nexit 1\n", "pull_request_write", false, true},
 	} {
