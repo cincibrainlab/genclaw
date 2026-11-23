@@ -79,6 +79,35 @@ func (m *fakeProgressMessenger) SendOrEditProgress(_ context.Context, channelNam
 	return id, nil
 }
 
+type delayedProgressMessenger struct {
+	entered chan struct{}
+	release chan struct{}
+	mu      sync.Mutex
+	calls   int
+	visible string
+}
+
+func (m *delayedProgressMessenger) SendOrEditProgress(ctx context.Context, _, _, messageID string, msg bus.OutboundMessage) (string, error) {
+	m.mu.Lock()
+	m.calls++
+	delay := m.calls == 1
+	m.mu.Unlock()
+	if delay {
+		close(m.entered)
+		select {
+		case <-m.release:
+		case <-ctx.Done():
+		}
+	}
+	m.mu.Lock()
+	m.visible = msg.Content
+	m.mu.Unlock()
+	if messageID == "" {
+		return "status-card", nil
+	}
+	return messageID, nil
+}
+
 type fakeJobRunner struct {
 	started chan struct{}
 	block   chan struct{}
@@ -975,24 +1004,41 @@ func TestJobManagerStatusListsMultipleJobs(t *testing.T) {
 
 func TestJobManagerWritesProgressAndFinalState(t *testing.T) {
 	mb := bus.NewMessageBus()
-	defer mb.Close()
+	t.Cleanup(mb.Close)
 
 	progress := &fakeProgressMessenger{}
+	runner := &fakeJobRunner{started: make(chan struct{}), block: make(chan struct{})}
+	var releaseRunner sync.Once
+	release := func() { releaseRunner.Do(func() { close(runner.block) }) }
 	jm, err := NewJobManager(filepathJoin(t.TempDir(), "jobs.json"), config.JobsConfig{
 		Enabled:               true,
 		MaxConcurrent:         1,
 		ProgressUpdateSeconds: 1,
 		DiscordAsyncDefault:   true,
 	}, mb, progress, func(target LoopTarget) (JobRunner, error) {
-		return &fakeJobRunner{}, nil
+		return runner, nil
 	})
 	if err != nil {
 		t.Fatalf("NewJobManager: %v", err)
 	}
 
 	target := LoopTarget{Workspace: "/tmp/work", Runtime: RuntimeProfile{Mode: config.ModeCloud}}
+	t.Cleanup(func() {
+		release()
+		if !noActiveJobsWithin(jm, target.key(), time.Second) {
+			t.Error("timed out joining job runner")
+		}
+		if !statusSendsDrainedWithin(jm, time.Second) {
+			t.Error("timed out joining queued-status sender")
+		}
+	})
 	if err := jm.Submit(context.Background(), target, bus.InboundMessage{Channel: "discord", ChatID: "room-1", Content: "do it"}); err != nil {
 		t.Fatalf("Submit: %v", err)
+	}
+	select {
+	case <-runner.started:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for job runner to start")
 	}
 
 	deadline := time.Now().Add(2 * time.Second)
@@ -1005,6 +1051,20 @@ func TestJobManagerWritesProgressAndFinalState(t *testing.T) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
+	release()
+
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		progress.mu.Lock()
+		done := len(progress.calls) > 0 && strings.Contains(progress.calls[len(progress.calls)-1], "Done. Reply below.")
+		progress.mu.Unlock()
+		if done {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	waitForNoActiveJobs(t, jm, target.key())
+	waitForStatusSends(t, jm)
 
 	progress.mu.Lock()
 	defer progress.mu.Unlock()
@@ -1016,6 +1076,68 @@ func TestJobManagerWritesProgressAndFinalState(t *testing.T) {
 	}
 	if !strings.Contains(progress.calls[len(progress.calls)-1], "Done. Reply below.") {
 		t.Fatalf("expected final progress update, got %q", progress.calls[len(progress.calls)-1])
+	}
+}
+
+func TestQueuedStatusCompletingBeforeDeadlineCannotReplaceFinalProgress(t *testing.T) {
+	messenger := &delayedProgressMessenger{
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(messenger.release) }) }
+	active := &activeJob{record: JobRecord{
+		ID: "job-1", ShortID: "00001", Channel: "discord", ChatID: "room-1",
+		State: JobStateQueued, Phase: "queued", Detail: "Queued", StatusMessageID: "status-card",
+	}}
+	jm := &JobManager{
+		progress: &boundedProgress{next: messenger, slots: make(chan struct{}, 2)},
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- jm.sendQueuedStatus(ctx, active, JobRecord{}, 0) }()
+	joined := false
+	defer func() {
+		release()
+		if !joined {
+			select {
+			case <-done:
+			case <-time.After(2 * time.Second):
+				t.Error("timed out joining delayed queued-status sender")
+			}
+		}
+	}()
+	select {
+	case <-messenger.entered:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for queued-status send to enter")
+	}
+
+	active.update(func(record *JobRecord) {
+		record.State = JobStateDone
+		record.Phase = "done"
+		record.Detail = "Done. Reply posted below."
+	})
+	if _, err := jm.syncTrackedJobProgress(context.Background(), active); err != nil {
+		t.Fatalf("send final progress: %v", err)
+	}
+	release()
+	select {
+	case err := <-done:
+		joined = true
+		if err != nil {
+			t.Fatalf("send queued status: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for queued-status sender")
+	}
+
+	messenger.mu.Lock()
+	visible := messenger.visible
+	messenger.mu.Unlock()
+	if !strings.Contains(visible, "Done. Reply below.") {
+		t.Fatalf("delayed queued status replaced final progress: %q", visible)
 	}
 }
 
@@ -1906,17 +2028,41 @@ func waitForQueuedCards(t *testing.T, jm *JobManager, targetKey string, want int
 
 func waitForNoActiveJobs(t *testing.T, jm *JobManager, targetKey string) {
 	t.Helper()
-	deadline := time.Now().Add(time.Second)
+	if !noActiveJobsWithin(jm, targetKey, time.Second) {
+		t.Fatalf("timed out waiting for active jobs to clear for %s", targetKey)
+	}
+}
+
+func noActiveJobsWithin(jm *JobManager, targetKey string, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		jm.mu.Lock()
 		_, ok := jm.active[targetKey]
 		jm.mu.Unlock()
 		if !ok {
-			return
+			return true
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatalf("timed out waiting for active jobs to clear for %s", targetKey)
+	return false
+}
+
+func waitForStatusSends(t *testing.T, jm *JobManager) {
+	t.Helper()
+	if !statusSendsDrainedWithin(jm, time.Second) {
+		t.Fatal("timed out waiting for queued-status senders")
+	}
+}
+
+func statusSendsDrainedWithin(jm *JobManager, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if len(jm.statusSlots) == 0 {
+			return true
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return false
 }
 
 func findJobRecordByAskSummary(t *testing.T, jm *JobManager, askSummary string) JobRecord {
