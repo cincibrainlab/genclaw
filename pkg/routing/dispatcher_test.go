@@ -44,6 +44,35 @@ func TestDispatcherSendBlockNotice_UnmappedIncludesAppAndMentionOnlyGuidance(t *
 	}
 }
 
+func TestDispatcherAllowsUsesCurrentResolverAfterReplacement(t *testing.T) {
+	workspace := t.TempDir()
+	first := config.DefaultConfig()
+	first.Routing.Enabled = true
+	first.Routing.UnmappedBehavior = config.RoutingUnmappedBehaviorBlock
+	first.Routing.Mappings = []config.RoutingMapping{{
+		Channel: "discord", ChatID: "room", Workspace: workspace, AllowedSenders: []string{"u1"},
+	}}
+	firstResolver, err := NewResolver(first)
+	if err != nil {
+		t.Fatalf("NewResolver first: %v", err)
+	}
+	second := first
+	second.Routing.Mappings[0].AllowedSenders = []string{"u2"}
+	secondResolver, err := NewResolver(second)
+	if err != nil {
+		t.Fatalf("NewResolver second: %v", err)
+	}
+	d := NewDispatcher(bus.NewMessageBus(), firstResolver, nil)
+	msg := bus.InboundMessage{Channel: "discord", ChatID: "room", SenderID: "u1", Metadata: map[string]string{"is_mention": "true"}}
+	if !d.Allows(msg) {
+		t.Fatal("initial resolver should allow u1")
+	}
+	d.ReplaceResolver(secondResolver)
+	if d.Allows(msg) {
+		t.Fatal("replaced resolver should deny u1")
+	}
+}
+
 func TestDispatcherSendBlockNotice_InternalChannelSkipsNotice(t *testing.T) {
 	mb := bus.NewMessageBus()
 	defer mb.Close()

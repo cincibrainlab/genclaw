@@ -133,6 +133,11 @@ func (r *Resolver) Resolve(msg bus.InboundMessage) Decision {
 	}
 
 	mapping, ok := r.mappings[mappingKey(channel, chatID)]
+	if !ok && channel == "discord" && strings.EqualFold(strings.TrimSpace(msg.Metadata["is_thread"]), "true") {
+		if parentChatID := strings.TrimSpace(msg.Metadata["parent_channel_id"]); parentChatID != "" {
+			mapping, ok = r.mappings[mappingKey(channel, parentChatID)]
+		}
+	}
 	if !ok {
 		switch r.unmappedBehavior {
 		case config.RoutingUnmappedBehaviorDefault:

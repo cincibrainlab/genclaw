@@ -98,6 +98,13 @@ func (d *Dispatcher) getResolver() *Resolver {
 	return d.resolver
 }
 
+// Allows resolves a message against the current resolver. It is used by
+// channel adapters that must gate side effects before publishing the message.
+func (d *Dispatcher) Allows(msg bus.InboundMessage) bool {
+	resolver := d.getResolver()
+	return resolver != nil && resolver.Resolve(msg).Allowed
+}
+
 func (d *Dispatcher) getJobManager() *JobManager {
 	d.mu.RLock()
 	defer d.mu.RUnlock()

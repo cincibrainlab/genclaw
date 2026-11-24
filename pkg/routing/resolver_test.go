@@ -50,6 +50,115 @@ func TestResolve_Match(t *testing.T) {
 	}
 }
 
+func TestResolve_DiscordThreadInheritsParentMapping(t *testing.T) {
+	ws := t.TempDir()
+	cfg := config.DefaultConfig()
+	cfg.Routing.Enabled = true
+	cfg.Routing.Mappings = []config.RoutingMapping{{
+		Channel:        "discord",
+		ChatID:         "parent",
+		Workspace:      ws,
+		AllowedSenders: []string{"u1"},
+		RequireMention: func() *bool { v := true; return &v }(),
+	}}
+	resolver, err := NewResolver(cfg)
+	if err != nil {
+		t.Fatalf("NewResolver error: %v", err)
+	}
+
+	d := resolver.Resolve(bus.InboundMessage{
+		Channel:  "discord",
+		ChatID:   "thread",
+		SenderID: "u1",
+		Metadata: map[string]string{
+			"parent_channel_id": "parent",
+			"is_thread":         "true",
+			"is_mention":        "true",
+		},
+	})
+	if !d.Allowed || d.Workspace != ws {
+		t.Fatalf("expected inherited mapping, got %+v", d)
+	}
+	if !strings.HasPrefix(d.SessionKey, "discord:thread@") {
+		t.Fatalf("session key = %q, want thread-specific identity", d.SessionKey)
+	}
+}
+
+func TestResolve_DiscordThreadKeepsParentSenderPolicy(t *testing.T) {
+	ws := t.TempDir()
+	cfg := config.DefaultConfig()
+	cfg.Routing.Enabled = true
+	cfg.Routing.Mappings = []config.RoutingMapping{{
+		Channel:        "discord",
+		ChatID:         "parent",
+		Workspace:      ws,
+		AllowedSenders: []string{"u1"},
+	}}
+	resolver, err := NewResolver(cfg)
+	if err != nil {
+		t.Fatalf("NewResolver error: %v", err)
+	}
+	d := resolver.Resolve(bus.InboundMessage{
+		Channel:  "discord",
+		ChatID:   "thread",
+		SenderID: "u2",
+		Metadata: map[string]string{"parent_channel_id": "parent", "is_thread": "true", "is_mention": "true"},
+	})
+	if d.Allowed || d.Event != EventRouteDeny {
+		t.Fatalf("expected inherited sender denial, got %+v", d)
+	}
+}
+
+func TestResolve_DiscordUntrustedParentMetadataDoesNotInherit(t *testing.T) {
+	ws := t.TempDir()
+	cfg := config.DefaultConfig()
+	cfg.Routing.Enabled = true
+	cfg.Routing.UnmappedBehavior = config.RoutingUnmappedBehaviorBlock
+	cfg.Routing.Mappings = []config.RoutingMapping{{
+		Channel:        "discord",
+		ChatID:         "parent",
+		Workspace:      ws,
+		AllowedSenders: []string{"u1"},
+	}}
+	resolver, err := NewResolver(cfg)
+	if err != nil {
+		t.Fatalf("NewResolver error: %v", err)
+	}
+	d := resolver.Resolve(bus.InboundMessage{
+		Channel:  "discord",
+		ChatID:   "thread",
+		SenderID: "u1",
+		Metadata: map[string]string{"parent_channel_id": "parent", "is_mention": "true"},
+	})
+	if d.Allowed || d.Event != EventRouteUnmapped {
+		t.Fatalf("expected untrusted parent metadata to remain unmapped, got %+v", d)
+	}
+}
+
+func TestResolve_DiscordExplicitThreadMappingTakesPrecedence(t *testing.T) {
+	parentWS := t.TempDir()
+	threadWS := t.TempDir()
+	cfg := config.DefaultConfig()
+	cfg.Routing.Enabled = true
+	cfg.Routing.Mappings = []config.RoutingMapping{
+		{Channel: "discord", ChatID: "parent", Workspace: parentWS, AllowedSenders: []string{"u1"}},
+		{Channel: "discord", ChatID: "thread", Workspace: threadWS, AllowedSenders: []string{"u2"}},
+	}
+	resolver, err := NewResolver(cfg)
+	if err != nil {
+		t.Fatalf("NewResolver error: %v", err)
+	}
+	d := resolver.Resolve(bus.InboundMessage{
+		Channel:  "discord",
+		ChatID:   "thread",
+		SenderID: "u2",
+		Metadata: map[string]string{"parent_channel_id": "parent", "is_mention": "true"},
+	})
+	if !d.Allowed || d.Workspace != threadWS {
+		t.Fatalf("expected explicit thread mapping, got %+v", d)
+	}
+}
+
 func TestResolve_UnmappedBlock(t *testing.T) {
 	cfg := config.DefaultConfig()
 	cfg.Routing.Enabled = true
