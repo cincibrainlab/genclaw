@@ -1812,6 +1812,13 @@ func gatewayCmd() {
 			jobManager.SetSideLaneResolver(loopPool.ResolveBTWJobHandler)
 		}
 		routingDispatcher = routing.NewDispatcher(msgBus, resolver, loopPool)
+		if discordChannel, ok := channelManager.GetChannel("discord"); ok {
+			if dc, ok := discordChannel.(*channels.DiscordChannel); ok {
+				dc.SetRouteCheck(func(msg bus.InboundMessage) bool {
+					return routingDispatcher.Allows(msg)
+				})
+			}
+		}
 		if jobManager != nil {
 			routingDispatcher.SetJobManager(jobManager)
 		}

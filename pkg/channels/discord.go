@@ -63,6 +63,8 @@ type DiscordChannel struct {
 	sendProgressMessageFn func(channelID string, msg bus.OutboundMessage) (string, error)
 	sendFileFn            func(channelID, content string, attachment bus.OutboundAttachment) error
 	sendTypingFn          func(channelID string) error
+	startThreadFn         func(channelID, messageID, name string) (*discordgo.Channel, error)
+	routeCheckFn          func(bus.InboundMessage) bool
 	editMessageFn         func(channelID, messageID string, msg bus.OutboundMessage) error
 	interactionRespondFn  func(interaction *discordgo.Interaction, resp *discordgo.InteractionResponse) error
 	interactionEditFn     func(interaction *discordgo.Interaction, edit *discordgo.WebhookEdit) error
@@ -116,6 +118,9 @@ func NewDiscordChannel(cfg config.DiscordConfig, messageBus *bus.MessageBus) (*D
 		},
 		sendTypingFn: func(channelID string) error {
 			return session.ChannelTyping(channelID)
+		},
+		startThreadFn: func(channelID, messageID, name string) (*discordgo.Channel, error) {
+			return session.MessageThreadStart(channelID, messageID, name, 1440)
 		},
 		editMessageFn: func(channelID, messageID string, msg bus.OutboundMessage) error {
 			_, err := session.ChannelMessageEditComplex(discordMessageEdit(channelID, messageID, msg))
@@ -225,6 +230,13 @@ func (c *DiscordChannel) shouldDropDuplicateInbound(messageID, content string, m
 
 func (c *DiscordChannel) SetTranscriber(transcriber *voice.GroqTranscriber) {
 	c.transcriber = transcriber
+}
+
+// SetRouteCheck lets the gateway validate a top-level request before creating
+// a public thread. The message is still published when rejected so the router
+// can emit its normal inline deny/mention-only behavior.
+func (c *DiscordChannel) SetRouteCheck(fn func(bus.InboundMessage) bool) {
+	c.routeCheckFn = fn
 }
 
 func (c *DiscordChannel) SetSlashSkillCatalogCallback(cb func(channelID, guildID, userID string) ([]SlashSkillChoice, error)) {
@@ -675,6 +687,58 @@ func (c *DiscordChannel) handleMessage(s *discordgo.Session, m *discordgo.Messag
 	c.processIncomingMessage(s, m.Message, false)
 }
 
+func (c *DiscordChannel) isThreadChannel(channelID string) bool {
+	if c.session == nil || c.session.State == nil {
+		return false
+	}
+	channel, err := c.session.State.Channel(channelID)
+	return err == nil && channel != nil && channel.IsThread()
+}
+
+func (c *DiscordChannel) parentChannelID(channelID string) string {
+	if strings.TrimSpace(channelID) == "" || c.session == nil || c.session.State == nil {
+		return ""
+	}
+	channel, err := c.session.State.Channel(channelID)
+	if err != nil || channel == nil || !channel.IsThread() {
+		return ""
+	}
+	return strings.TrimSpace(channel.ParentID)
+}
+
+func discordThreadName(content string) string {
+	content = strings.Join(strings.Fields(content), " ")
+	if content == "" {
+		return "sciClaw request"
+	}
+	name := "sciClaw: " + content
+	if len([]rune(name)) > 100 {
+		name = string([]rune(name)[:97]) + "..."
+	}
+	return name
+}
+
+func (c *DiscordChannel) threadForTopLevelMessage(m *discordgo.Message) string {
+	if m == nil {
+		return ""
+	}
+	if m.GuildID == "" || c.isThreadChannel(m.ChannelID) || c.startThreadFn == nil {
+		return m.ChannelID
+	}
+	thread, err := c.startThreadFn(m.ChannelID, m.ID, discordThreadName(m.Content))
+	if err != nil || thread == nil || strings.TrimSpace(thread.ID) == "" {
+		if err != nil {
+			logger.WarnCF("discord", "Failed to create request thread; using inline response", map[string]any{
+				"channel_id": m.ChannelID,
+				"message_id": m.ID,
+				"error":      err.Error(),
+			})
+		}
+		return m.ChannelID
+	}
+	return thread.ID
+}
+
 func (c *DiscordChannel) handleInteractionCreate(_ *discordgo.Session, i *discordgo.InteractionCreate) {
 	if i == nil || i.Interaction == nil {
 		return
@@ -1091,7 +1155,6 @@ func (c *DiscordChannel) processIncomingMessage(_ *discordgo.Session, m *discord
 	if content == "" {
 		content = "[media only]"
 	}
-
 	if c.shouldDropDuplicateInbound(m.ID, content, mediaPaths, hasDirectMention, replyToBot) {
 		logger.InfoCF("discord", "Dropping duplicate inbound message event", map[string]any{
 			"message_id": m.ID,
@@ -1102,28 +1165,58 @@ func (c *DiscordChannel) processIncomingMessage(_ *discordgo.Session, m *discord
 		return
 	}
 
+	chatID := m.ChannelID
+
 	logger.DebugCF("discord", "Received message", map[string]any{
 		"sender_name": senderName,
 		"sender_id":   senderID,
 		"preview":     utils.Truncate(content, 50),
 		"is_edit":     editOnly,
 	})
-	if isMention {
-		c.startTyping(m.ChannelID)
-	}
-
 	metadata := map[string]string{
 		"message_id":         m.ID,
 		"user_id":            senderID,
 		"username":           m.Author.Username,
 		"display_name":       senderName,
 		"guild_id":           m.GuildID,
-		"channel_id":         m.ChannelID,
+		"channel_id":         chatID,
+		"parent_channel_id":  m.ChannelID,
 		"is_dm":              fmt.Sprintf("%t", m.GuildID == ""),
 		"is_mention":         fmt.Sprintf("%t", isMention),
 		"has_direct_mention": fmt.Sprintf("%t", hasDirectMention),
 		"reply_to_bot":       fmt.Sprintf("%t", replyToBot),
 		"is_edit":            fmt.Sprintf("%t", editOnly),
+	}
+	if parentID := c.parentChannelID(m.ChannelID); parentID != "" {
+		metadata["parent_channel_id"] = parentID
+		metadata["is_thread"] = "true"
+	}
+	if !editOnly && c.routeCheckFn != nil {
+		accepted := c.routeCheckFn(bus.InboundMessage{
+			Channel:  "discord",
+			ChatID:   m.ChannelID,
+			SenderID: senderID,
+			Content:  content,
+			Media:    mediaPaths,
+			Metadata: metadata,
+		})
+		if accepted {
+			chatID = c.threadForTopLevelMessage(m)
+			if chatID != m.ChannelID {
+				metadata["parent_channel_id"] = m.ChannelID
+				metadata["is_thread"] = "true"
+			}
+		}
+	} else if !editOnly {
+		chatID = c.threadForTopLevelMessage(m)
+		if chatID != m.ChannelID {
+			metadata["parent_channel_id"] = m.ChannelID
+			metadata["is_thread"] = "true"
+		}
+	}
+	metadata["channel_id"] = chatID
+	if isMention {
+		c.startTyping(chatID)
 	}
 	if m.MessageReference != nil {
 		metadata["reply_message_id"] = strings.TrimSpace(m.MessageReference.MessageID)
@@ -1132,7 +1225,7 @@ func (c *DiscordChannel) processIncomingMessage(_ *discordgo.Session, m *discord
 		metadata["reply_author_id"] = strings.TrimSpace(m.ReferencedMessage.Author.ID)
 	}
 
-	c.HandleMessage(senderID, m.ChannelID, content, mediaPaths, metadata)
+	c.HandleMessage(senderID, chatID, content, mediaPaths, metadata)
 }
 
 func (c *DiscordChannel) downloadAttachment(url, filename string) string {
