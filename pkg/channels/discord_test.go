@@ -50,6 +50,27 @@ func TestNormalizeDiscordBotToken(t *testing.T) {
 	}
 }
 
+func TestDiscordThreadName(t *testing.T) {
+	if got := discordThreadName("  analyze   this request "); got != "sciClaw: analyze this request" {
+		t.Fatalf("discordThreadName() = %q", got)
+	}
+	long := discordThreadName(strings.Repeat("x", 200))
+	if len([]rune(long)) != 100 || !strings.HasSuffix(long, "...") {
+		t.Fatalf("long thread name = %q, want 100 runes ending in ellipsis", long)
+	}
+}
+
+func TestDiscordThreadForTopLevelMessageFallsBackInline(t *testing.T) {
+	ch := newTestDiscordChannel()
+	ch.startThreadFn = func(channelID, messageID, name string) (*discordgo.Channel, error) {
+		return nil, fmt.Errorf("thread creation unavailable")
+	}
+	m := &discordgo.Message{ID: "msg-1", ChannelID: "channel-1", GuildID: "guild-1", Content: "request"}
+	if got := ch.threadForTopLevelMessage(m); got != m.ChannelID {
+		t.Fatalf("threadForTopLevelMessage() = %q, want inline channel %q", got, m.ChannelID)
+	}
+}
+
 func TestDiscordTypingStopsOnFirstReply(t *testing.T) {
 	ch := newTestDiscordChannel()
 	var mu sync.Mutex
