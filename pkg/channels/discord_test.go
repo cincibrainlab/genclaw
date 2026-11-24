@@ -486,6 +486,10 @@ func TestDiscordEnsureSlashCommandsCreatesSlashCommands(t *testing.T) {
 			if len(cmd.Options) != 1 || cmd.Options[0].Name != "style" || !cmd.Options[0].Required {
 				t.Fatalf("unexpected theme command options: %#v", cmd.Options)
 			}
+		case "help":
+			if len(cmd.Options) != 0 || cmd.Description == "" {
+				t.Fatalf("unexpected help command options: %#v", cmd)
+			}
 		default:
 			t.Fatalf("unexpected command name: %q", cmd.Name)
 		}
@@ -499,8 +503,48 @@ func TestDiscordEnsureSlashCommandsCreatesSlashCommands(t *testing.T) {
 	if err := ch.ensureSlashCommands(); err != nil {
 		t.Fatalf("ensureSlashCommands: %v", err)
 	}
-	if len(created) != 3 {
-		t.Fatalf("expected three create calls, got %d (%v)", len(created), created)
+	if len(created) != 4 {
+		t.Fatalf("expected four create calls, got %d (%v)", len(created), created)
+	}
+}
+
+func TestDiscordNativeHelpInteractionIsDeterministicAndDoesNotPublish(t *testing.T) {
+	ch := newTestDiscordChannel()
+	ch.BaseChannel.allowList = []string{"allowed-user"}
+	var response *discordgo.InteractionResponse
+	ch.interactionRespondFn = func(_ *discordgo.Interaction, resp *discordgo.InteractionResponse) error { response = resp; return nil }
+	ch.handleInteractionCreate(nil, &discordgo.InteractionCreate{Interaction: &discordgo.Interaction{
+		Type:      discordgo.InteractionApplicationCommand,
+		ChannelID: "chan-help", Member: &discordgo.Member{User: &discordgo.User{ID: "allowed-user"}},
+		Data: discordgo.ApplicationCommandInteractionData{Name: "help"},
+	}})
+	if response == nil || response.Type != discordgo.InteractionResponseChannelMessageWithSource || response.Data == nil || response.Data.Content != helpMessage {
+		t.Fatalf("unexpected native help response: %#v", response)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if _, ok := ch.BaseChannel.bus.ConsumeInbound(ctx); ok {
+		t.Fatal("native help must not publish inbound work")
+	}
+}
+
+func TestDiscordNativeHelpInteractionEnforcesAllowlist(t *testing.T) {
+	ch := newTestDiscordChannel()
+	ch.BaseChannel.allowList = []string{"allowed-user"}
+	var response *discordgo.InteractionResponse
+	ch.interactionRespondFn = func(_ *discordgo.Interaction, resp *discordgo.InteractionResponse) error { response = resp; return nil }
+	ch.handleInteractionCreate(nil, &discordgo.InteractionCreate{Interaction: &discordgo.Interaction{
+		Type:   discordgo.InteractionApplicationCommand,
+		Member: &discordgo.Member{User: &discordgo.User{ID: "denied-user"}},
+		Data:   discordgo.ApplicationCommandInteractionData{Name: "help"},
+	}})
+	if response == nil || response.Data == nil || !strings.Contains(response.Data.Content, "not allowed") {
+		t.Fatalf("unexpected denied response: %#v", response)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if _, ok := ch.BaseChannel.bus.ConsumeInbound(ctx); ok {
+		t.Fatal("denied native help must not publish inbound work")
 	}
 }
 

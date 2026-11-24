@@ -21,14 +21,16 @@ import (
 
 type SlackChannel struct {
 	*BaseChannel
-	config       config.SlackConfig
-	api          *slack.Client
-	socketClient *socketmode.Client
-	botUserID    string
-	transcriber  *voice.GroqTranscriber
-	ctx          context.Context
-	cancel       context.CancelFunc
-	pendingAcks  sync.Map
+	config        config.SlackConfig
+	api           *slack.Client
+	socketClient  *socketmode.Client
+	botUserID     string
+	transcriber   *voice.GroqTranscriber
+	ctx           context.Context
+	cancel        context.CancelFunc
+	pendingAcks   sync.Map
+	sendFn        func(context.Context, bus.OutboundMessage) error
+	addReactionFn func(string, string)
 }
 
 type slackMessageRef struct {
@@ -108,6 +110,9 @@ func (c *SlackChannel) Stop(ctx context.Context) error {
 }
 
 func (c *SlackChannel) Send(ctx context.Context, msg bus.OutboundMessage) error {
+	if c.sendFn != nil {
+		return c.sendFn(ctx, msg)
+	}
 	if !c.IsRunning() {
 		return fmt.Errorf("slack channel not running")
 	}
@@ -144,6 +149,14 @@ func (c *SlackChannel) Send(ctx context.Context, msg bus.OutboundMessage) error 
 	})
 
 	return nil
+}
+
+func (c *SlackChannel) addReaction(name, channel, timestamp string) {
+	if c.addReactionFn != nil {
+		c.addReactionFn(channel, timestamp)
+		return
+	}
+	c.api.AddReaction(name, slack.ItemRef{Channel: channel, Timestamp: timestamp})
 }
 
 func (c *SlackChannel) eventLoop() {
@@ -224,10 +237,7 @@ func (c *SlackChannel) handleMessageEvent(ev *slackevents.MessageEvent) {
 		return
 	}
 
-	c.api.AddReaction("eyes", slack.ItemRef{
-		Channel:   channelID,
-		Timestamp: messageTS,
-	})
+	c.addReaction("eyes", channelID, messageTS)
 
 	c.pendingAcks.Store(chatID, slackMessageRef{
 		ChannelID: channelID,
@@ -320,17 +330,16 @@ func (c *SlackChannel) handleAppMention(ev *slackevents.AppMentionEvent) {
 		chatID = channelID + "/" + messageTS
 	}
 
-	c.api.AddReaction("eyes", slack.ItemRef{
-		Channel:   channelID,
-		Timestamp: messageTS,
-	})
-
-	c.pendingAcks.Store(chatID, slackMessageRef{
-		ChannelID: channelID,
-		Timestamp: messageTS,
-	})
-
 	content := c.stripBotMention(ev.Text)
+	if isHelpCommand(content) {
+		if err := c.Send(c.ctx, bus.OutboundMessage{Channel: "slack", ChatID: chatID, Content: helpMessage}); err != nil {
+			logger.WarnCF("slack", "Failed to send deterministic help", map[string]interface{}{"error": err.Error()})
+		}
+		return
+	}
+
+	c.addReaction("eyes", channelID, messageTS)
+	c.pendingAcks.Store(chatID, slackMessageRef{ChannelID: channelID, Timestamp: messageTS})
 
 	if strings.TrimSpace(content) == "" {
 		return

@@ -505,6 +505,10 @@ func buildThemeSlashCommand() *discordgo.ApplicationCommand {
 	}
 }
 
+func buildHelpSlashCommand() *discordgo.ApplicationCommand {
+	return &discordgo.ApplicationCommand{Name: "help", Description: "Show sciClaw help and documentation"}
+}
+
 func interactionAuthor(i *discordgo.Interaction) *discordgo.User {
 	if i == nil {
 		return nil
@@ -646,7 +650,7 @@ func (c *DiscordChannel) ensureSlashCommands() error {
 		}
 		existingByName[existing.Name] = existing
 	}
-	for _, cmd := range []*discordgo.ApplicationCommand{buildBTWSlashCommand(), buildSkillSlashCommand(), buildThemeSlashCommand()} {
+	for _, cmd := range []*discordgo.ApplicationCommand{buildBTWSlashCommand(), buildSkillSlashCommand(), buildThemeSlashCommand(), buildHelpSlashCommand()} {
 		existing := existingByName[cmd.Name]
 		if existing == nil {
 			if _, err := c.createCommandFn(c.botUserID, "", cmd); err != nil {
@@ -698,7 +702,18 @@ func (c *DiscordChannel) handleInteractionCreate(_ *discordgo.Session, i *discor
 		c.handleSkillInteraction(i, data)
 	case "theme":
 		c.handleThemeInteraction(i, data)
+	case "help":
+		c.handleHelpInteraction(i)
 	}
+}
+
+func (c *DiscordChannel) handleHelpInteraction(i *discordgo.InteractionCreate) {
+	author := interactionAuthor(i.Interaction)
+	if author == nil || !c.IsAllowed(author.ID) {
+		c.respondInteractionMessage(i.Interaction, "You are not allowed to use this sciClaw bot.")
+		return
+	}
+	c.respondInteractionMessage(i.Interaction, helpMessage)
 }
 
 func (c *DiscordChannel) respondInteractionMessage(i *discordgo.Interaction, content string) {

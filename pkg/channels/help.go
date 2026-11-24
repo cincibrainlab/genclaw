@@ -21,3 +21,12 @@ func isHelpCommand(content string) bool {
 		return false
 	}
 }
+
+func isTelegramHelpCommand(content, botUsername string) bool {
+	content = strings.ToLower(strings.TrimSpace(content))
+	if content == "help" || content == "/help" || content == "!help" {
+		return true
+	}
+	username := strings.ToLower(strings.TrimPrefix(strings.TrimSpace(botUsername), "@"))
+	return username != "" && content == "/help@"+username
+}

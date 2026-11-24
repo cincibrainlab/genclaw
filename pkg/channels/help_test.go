@@ -26,3 +26,21 @@ func TestHelpMessageIncludesSupportedCommandsAndDocumentation(t *testing.T) {
 		}
 	}
 }
+
+func TestTelegramHelpCommandAcceptsOnlyOwnBotAddress(t *testing.T) {
+	for _, input := range []string{"help", "/help", "!help", "/help@SciClawBot"} {
+		if !isTelegramHelpCommand(input, "sciclawbot") {
+			t.Errorf("isTelegramHelpCommand(%q) = false", input)
+		}
+	}
+	if isTelegramHelpCommand("/help@otherbot", "sciclawbot") {
+		t.Fatal("help for another bot should remain normal traffic")
+	}
+}
+
+func TestBuildHelpSlashCommand(t *testing.T) {
+	cmd := buildHelpSlashCommand()
+	if cmd.Name != "help" || cmd.Description == "" || len(cmd.Options) != 0 {
+		t.Fatalf("unexpected help command: %+v", cmd)
+	}
+}

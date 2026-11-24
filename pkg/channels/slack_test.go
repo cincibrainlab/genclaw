@@ -1,11 +1,98 @@
 package channels
 
 import (
+	"context"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/sipeed/picoclaw/pkg/bus"
 	"github.com/sipeed/picoclaw/pkg/config"
+	"github.com/slack-go/slack"
+	"github.com/slack-go/slack/slackevents"
+	"github.com/slack-go/slack/socketmode"
 )
+
+func TestSlackAppMentionHelpUsesOutboundOnly(t *testing.T) {
+	mb := bus.NewMessageBus()
+	ch := &SlackChannel{BaseChannel: NewBaseChannel("slack", config.SlackConfig{}, mb, []string{"u1"}), ctx: context.Background(), botUserID: "bot-1"}
+	ch.setRunning(true)
+	var sent []bus.OutboundMessage
+	reactions := 0
+	ch.sendFn = func(_ context.Context, msg bus.OutboundMessage) error { sent = append(sent, msg); return nil }
+	ch.addReactionFn = func(string, string) { reactions++ }
+	ch.handleAppMention(&slackevents.AppMentionEvent{User: "u1", Channel: "C1", TimeStamp: "t1", Text: "<@bot-1> help"})
+	if len(sent) != 1 || sent[0].Content != helpMessage || reactions != 0 || lenPendingAcks(ch) != 0 {
+		t.Fatalf("help path sent=%+v reactions=%d pending=%d", sent, reactions, lenPendingAcks(ch))
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if _, ok := mb.ConsumeInbound(ctx); ok {
+		t.Fatal("Slack help must not publish inbound work")
+	}
+}
+
+func TestSlackAppMentionHelpPreservesAllowlistAndNormalTraffic(t *testing.T) {
+	mb := bus.NewMessageBus()
+	ch := &SlackChannel{BaseChannel: NewBaseChannel("slack", config.SlackConfig{}, mb, []string{"u1"}), ctx: context.Background(), botUserID: "bot-1"}
+	ch.setRunning(true)
+	ch.sendFn = func(context.Context, bus.OutboundMessage) error { return nil }
+	ch.addReactionFn = func(string, string) {}
+	ch.handleAppMention(&slackevents.AppMentionEvent{User: "denied", Channel: "C1", TimeStamp: "t1", Text: "<@bot-1> help"})
+	ch.handleAppMention(&slackevents.AppMentionEvent{User: "u1", Channel: "C1", TimeStamp: "t2", Text: "<@bot-1> normal request"})
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	in, ok := mb.ConsumeInbound(ctx)
+	if !ok || !strings.Contains(in.Content, "normal request") {
+		t.Fatalf("expected normal app mention: %+v ok=%t", in, ok)
+	}
+}
+
+func TestSlackMessageEventHelpUsesExactOutboundTarget(t *testing.T) {
+	mb := bus.NewMessageBus()
+	ch := &SlackChannel{BaseChannel: NewBaseChannel("slack", config.SlackConfig{}, mb, []string{"u1"}), ctx: context.Background(), botUserID: "bot-1"}
+	ch.setRunning(true)
+	var sent []bus.OutboundMessage
+	ch.sendFn = func(_ context.Context, msg bus.OutboundMessage) error { sent = append(sent, msg); return nil }
+	reactions := 0
+	ch.addReactionFn = func(string, string) { reactions++ }
+	ch.handleMessageEvent(&slackevents.MessageEvent{User: "u1", Channel: "C1", ThreadTimeStamp: "thread-1", TimeStamp: "message-1", Text: "help"})
+	if len(sent) != 1 || sent[0].Channel != "slack" || sent[0].ChatID != "C1/thread-1" || sent[0].Content != helpMessage || reactions != 0 || lenPendingAcks(ch) != 0 {
+		t.Fatalf("message help sent=%+v reactions=%d pending=%d", sent, reactions, lenPendingAcks(ch))
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if _, ok := mb.ConsumeInbound(ctx); ok {
+		t.Fatal("Slack message help must not publish inbound work")
+	}
+}
+
+func TestSlackSlashHelpUsesExactOutboundTargetAndDeniedUserDoesNothing(t *testing.T) {
+	mb := bus.NewMessageBus()
+	ch := &SlackChannel{BaseChannel: NewBaseChannel("slack", config.SlackConfig{}, mb, []string{"u1"}), ctx: context.Background()}
+	ch.setRunning(true)
+	var sent []bus.OutboundMessage
+	ch.sendFn = func(_ context.Context, msg bus.OutboundMessage) error { sent = append(sent, msg); return nil }
+	ch.handleSlashCommand(socketmode.Event{Data: slack.SlashCommand{UserID: "u1", ChannelID: "C2", Command: "/help"}})
+	if len(sent) != 1 || sent[0].Channel != "slack" || sent[0].ChatID != "C2" || sent[0].Content != helpMessage {
+		t.Fatalf("slash help sent=%+v", sent)
+	}
+	ch.handleSlashCommand(socketmode.Event{Data: slack.SlashCommand{UserID: "denied", ChannelID: "C3", Command: "/help"}})
+	if len(sent) != 1 {
+		t.Fatalf("denied slash help must not send, got=%+v", sent)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if _, ok := mb.ConsumeInbound(ctx); ok {
+		t.Fatal("Slack slash help must not publish inbound work")
+	}
+}
+
+func lenPendingAcks(ch *SlackChannel) int {
+	n := 0
+	ch.pendingAcks.Range(func(_, _ any) bool { n++; return true })
+	return n
+}
 
 func TestParseSlackChatID(t *testing.T) {
 	tests := []struct {

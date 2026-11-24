@@ -6,10 +6,46 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/mymmrac/telego"
 	"github.com/sipeed/picoclaw/pkg/bus"
 	"github.com/sipeed/picoclaw/pkg/config"
 )
+
+func TestTelegramHelpAddressingUsesOutboundOnlyAndOwnBot(t *testing.T) {
+	mb := bus.NewMessageBus()
+	ch := &TelegramChannel{BaseChannel: NewBaseChannel("telegram", config.TelegramConfig{}, mb, []string{"1"}), chatIDs: map[string]int64{}, botUsername: "ownbot"}
+	ch.setRunning(true)
+	ch.sendChatActionFn = func(context.Context, int64) error { return nil }
+	var sent []bus.OutboundMessage
+	ch.sendFn = func(_ context.Context, msg bus.OutboundMessage) error { sent = append(sent, msg); return nil }
+	ch.handleMessage(context.Background(), telego.Update{Message: &telego.Message{From: &telego.User{ID: 1}, Chat: telego.Chat{ID: 2, Type: "group"}, Text: "/help@ownbot"}})
+	if len(sent) != 1 || sent[0].Channel != "telegram" || sent[0].ChatID != "2" || sent[0].Content != helpMessage {
+		t.Fatalf("own-bot help sent=%+v", sent)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if _, ok := mb.ConsumeInbound(ctx); ok {
+		t.Fatal("Telegram help must not publish inbound work")
+	}
+	ch.handleMessage(context.Background(), telego.Update{Message: &telego.Message{From: &telego.User{ID: 2}, Chat: telego.Chat{ID: 99, Type: "group"}, Text: "/help@ownbot"}})
+	if len(sent) != 1 {
+		t.Fatalf("denied Telegram help must not send, got=%+v", sent)
+	}
+	ctx, cancel = context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if _, ok := mb.ConsumeInbound(ctx); ok {
+		t.Fatal("denied Telegram help must not publish inbound work")
+	}
+	ch.handleMessage(context.Background(), telego.Update{Message: &telego.Message{From: &telego.User{ID: 1}, Chat: telego.Chat{ID: 2, Type: "group"}, Text: "/help@otherbot"}})
+	ctx, cancel = context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	in, ok := mb.ConsumeInbound(ctx)
+	if !ok || in.Content != "/help@otherbot" {
+		t.Fatalf("other-bot address should remain normal traffic: %+v ok=%t", in, ok)
+	}
+}
 
 func TestMarkdownToTelegramHTML_PreservesDistinctInlineCodes(t *testing.T) {
 	in := "Paths: `~/sciclaw/IDENTITY.md`, `~/sciclaw/AGENTS.md`, and `state/`."
