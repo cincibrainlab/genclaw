@@ -101,7 +101,9 @@ func TestDiscordTopLevelThreadCreationHappensAfterDeduplication(t *testing.T) {
 	if created != 1 {
 		t.Fatalf("thread creations = %d, want 1", created)
 	}
-	in, ok := mb.ConsumeInbound(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	in, ok := mb.ConsumeInbound(ctx)
 	if !ok || in.ChatID != "thread-1" {
 		t.Fatalf("inbound = %+v, ok=%t; want one message routed to thread-1", in, ok)
 	}
@@ -156,8 +158,8 @@ func TestDiscordCreatedThreadCarriesParentRoutingContext(t *testing.T) {
 	if err := s.State.ChannelAdd(&discordgo.Channel{ID: "thread-1", GuildID: "guild-1", Type: discordgo.ChannelTypeGuildPublicThread, ParentID: "channel-1"}); err != nil {
 		t.Fatalf("ChannelAdd: %v", err)
 	}
-	msg := &discordgo.Message{ID: "created", ChannelID: "channel-1", GuildID: "guild-1", Content: "request", Author: &discordgo.User{ID: "user-1"}}
 	ch.session = s
+	msg := &discordgo.Message{ID: "created", ChannelID: "channel-1", GuildID: "guild-1", Content: "request", Author: &discordgo.User{ID: "user-1"}}
 	ch.processIncomingMessage(s, msg, false)
 	first, ok := mb.ConsumeInbound(context.Background())
 	if !ok || first.ChatID != "thread-1" || first.Metadata["parent_channel_id"] != "channel-1" || first.Metadata["is_thread"] != "true" {
@@ -725,6 +727,100 @@ func TestDiscordNativeHelpInteractionEnforcesAllowlist(t *testing.T) {
 	defer cancel()
 	if _, ok := ch.BaseChannel.bus.ConsumeInbound(ctx); ok {
 		t.Fatal("denied native help must not publish inbound work")
+	}
+}
+
+func TestDiscordHelpAndThreadRoutingRemainIsolated(t *testing.T) {
+	workspace := t.TempDir()
+	cfg := config.DefaultConfig()
+	cfg.Routing.Enabled = true
+	cfg.Routing.Mappings = []config.RoutingMapping{{
+		Channel: "discord", ChatID: "channel-1", Workspace: workspace, AllowedSenders: []string{"user-1"}, RequireMention: func() *bool { v := false; return &v }(),
+	}}
+	resolver, err := routing.NewResolver(cfg)
+	if err != nil {
+		t.Fatalf("NewResolver: %v", err)
+	}
+	mb := bus.NewMessageBus()
+	ch := &DiscordChannel{
+		BaseChannel: NewBaseChannel("discord", config.DiscordConfig{}, mb, []string{"user-1"}),
+		ctx:         context.Background(), typing: make(map[string]*typingState), botUserID: "bot-1",
+		recentInbound: make(map[string]inboundMessageFingerprint),
+	}
+	var helpResponses []bus.OutboundMessage
+	threadStarts, routeChecks := 0, 0
+	ch.sendMessageFn = func(_ string, msg bus.OutboundMessage) error { helpResponses = append(helpResponses, msg); return nil }
+	ch.startThreadFn = func(channelID, messageID, name string) (*discordgo.Channel, error) {
+		threadStarts++
+		return &discordgo.Channel{ID: "thread-1"}, nil
+	}
+	ch.routeCheckFn = func(msg bus.InboundMessage) bool {
+		routeChecks++
+		return resolver.Resolve(msg).Allowed
+	}
+	ch.setRunning(true)
+	s := newTestSession("bot-1")
+	s.State = discordgo.NewState()
+	s.State.User = &discordgo.User{ID: "bot-1"}
+	if err := s.State.GuildAdd(&discordgo.Guild{ID: "guild-1"}); err != nil {
+		t.Fatalf("GuildAdd: %v", err)
+	}
+	if err := s.State.ChannelAdd(&discordgo.Channel{ID: "thread-1", GuildID: "guild-1", Type: discordgo.ChannelTypeGuildPublicThread, ParentID: "channel-1"}); err != nil {
+		t.Fatalf("ChannelAdd: %v", err)
+	}
+	ch.session = s
+
+	var interactionResponse *discordgo.InteractionResponse
+	ch.interactionRespondFn = func(_ *discordgo.Interaction, response *discordgo.InteractionResponse) error {
+		interactionResponse = response
+		return nil
+	}
+	ch.handleInteractionCreate(nil, &discordgo.InteractionCreate{Interaction: &discordgo.Interaction{
+		Type: discordgo.InteractionApplicationCommand, ChannelID: "channel-1", Member: &discordgo.Member{User: &discordgo.User{ID: "user-1"}},
+		Data: discordgo.ApplicationCommandInteractionData{Name: "help"},
+	}})
+	ch.processIncomingMessage(s, &discordgo.Message{ID: "help-text", ChannelID: "channel-1", GuildID: "guild-1", Content: "help", Author: &discordgo.User{ID: "user-1"}}, false)
+	if interactionResponse == nil || interactionResponse.Data == nil || interactionResponse.Data.Content != helpMessage || len(helpResponses) != 1 || helpResponses[0].Channel != "discord" || helpResponses[0].ChatID != "channel-1" || helpResponses[0].Content != helpMessage {
+		t.Fatalf("help responses interaction=%#v text=%+v", interactionResponse, helpResponses)
+	}
+	if threadStarts != 0 || routeChecks != 0 {
+		t.Fatalf("help must not start threads or route: threads=%d routes=%d", threadStarts, routeChecks)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if _, ok := mb.ConsumeInbound(ctx); ok {
+		t.Fatal("help must not publish inbound work")
+	}
+	ch.processIncomingMessage(s, &discordgo.Message{ID: "denied-help", ChannelID: "channel-1", GuildID: "guild-1", Content: "help", Author: &discordgo.User{ID: "denied-user"}}, false)
+	if len(helpResponses) != 1 || threadStarts != 0 || routeChecks != 0 {
+		t.Fatalf("denied help changed effects responses=%d threads=%d routes=%d", len(helpResponses), threadStarts, routeChecks)
+	}
+	ctx, cancel = context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if _, ok := mb.ConsumeInbound(ctx); ok {
+		t.Fatal("denied help must not publish inbound work")
+	}
+
+	ch.processIncomingMessage(s, &discordgo.Message{ID: "normal", ChannelID: "channel-1", GuildID: "guild-1", Content: "normal task", Author: &discordgo.User{ID: "user-1"}}, false)
+	if threadStarts != 1 || routeChecks != 1 {
+		t.Fatalf("normal task routing threads=%d routes=%d", threadStarts, routeChecks)
+	}
+	ctx, cancel = context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	in, ok := mb.ConsumeInbound(ctx)
+	if !ok || in.ChatID != "thread-1" {
+		t.Fatalf("normal inbound=%+v ok=%t", in, ok)
+	}
+	decision := resolver.Resolve(in)
+	if !decision.Allowed || decision.Workspace != workspace {
+		t.Fatalf("normal routing=%+v", decision)
+	}
+	ch.processIncomingMessage(s, &discordgo.Message{ID: "followup", ChannelID: "thread-1", GuildID: "guild-1", Content: "follow up", Author: &discordgo.User{ID: "user-1"}}, false)
+	ctx, cancel = context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	followup, ok := mb.ConsumeInbound(ctx)
+	if !ok || followup.ChatID != "thread-1" || followup.Metadata["parent_channel_id"] != "channel-1" || resolver.Resolve(followup).Workspace != workspace {
+		t.Fatalf("follow-up inbound=%+v ok=%t", followup, ok)
 	}
 }
 

@@ -14,3 +14,5 @@ Verify:
 Run focused channel tests, race tests, the broad test suite, `go vet`, `go build`, `git diff --check`, and inspect the final diff. Return a verdict, findings by severity with file/line references, commands rerun, unverified claims, and minimal remediation before merge. Live Discord/Slack/Telegram accounts are not required for this review; live delivery remains unverified. Do not merge or push fixes.
 
 Final QA additions: Slack `handleMessageEvent` and `handleSlashCommand` tests assert exact outbound channel/thread targets, zero inbound work, and denied-user zero sends; Telegram tests cover own-bot group addressing with exact chat ID and denied-sender zero sends/no inbound work. Positive inbound assertions use bounded contexts to avoid hanging on regressions.
+
+Stacked integration review base: PR #70 at `8ff25f583870e71e63aa9dfb4e079b86a7b829b3`; PR #71 source merged locally at `e04756bc3adcd603bdfdcde78aaf078e92ca45e0`. This packet's combined regression is intentionally unpublished and does not retarget either PR.
