@@ -51,8 +51,11 @@ New users should follow [Quick Start](#quick-start) below for the canonical setu
 Discord on current `main`/dev builds also supports:
 - queued background jobs with status/cancel cards
 - `/btw` for explicit read-only side questions in the current workspace
+- `/help` for deterministic help and documentation
 - `/skill` with workspace-aware autocomplete for explicit skill use
 - `/theme` to pick a response style (Clear, Formal, or Brief) that persists per user across sessions
+
+In Slack, configure the app's slash-command support (Socket Mode) for `/help`; the adapter handles the command but does not register it externally. In Telegram groups, use `/help@own_bot` to address this bot explicitly.
 
 ## Addons
 

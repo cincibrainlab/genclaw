@@ -26,14 +26,16 @@ const telegramMaxFileBytes = 50 * 1024 * 1024
 
 type TelegramChannel struct {
 	*BaseChannel
-	bot          *telego.Bot
-	config       config.TelegramConfig
-	chatIDs      map[string]int64
-	transcriber  *voice.GroqTranscriber
-	botUsername  string
-	placeholders sync.Map // chatID -> messageID
-	stopThinking sync.Map // chatID -> thinkingCancel
-	sendFileFn   func(ctx context.Context, chatID int64, attachment bus.OutboundAttachment) error
+	bot              *telego.Bot
+	config           config.TelegramConfig
+	chatIDs          map[string]int64
+	transcriber      *voice.GroqTranscriber
+	botUsername      string
+	placeholders     sync.Map // chatID -> messageID
+	stopThinking     sync.Map // chatID -> thinkingCancel
+	sendFileFn       func(ctx context.Context, chatID int64, attachment bus.OutboundAttachment) error
+	sendFn           func(context.Context, bus.OutboundMessage) error
+	sendChatActionFn func(context.Context, int64) error
 }
 
 type thinkingCancel struct {
@@ -129,6 +131,9 @@ func (c *TelegramChannel) Stop(ctx context.Context) error {
 }
 
 func (c *TelegramChannel) Send(ctx context.Context, msg bus.OutboundMessage) error {
+	if c.sendFn != nil {
+		return c.sendFn(ctx, msg)
+	}
 	if !c.IsRunning() {
 		return fmt.Errorf("telegram bot not running")
 	}
@@ -253,6 +258,12 @@ func (c *TelegramChannel) handleMessage(ctx context.Context, update telego.Updat
 			}
 		}
 	}
+	if isTelegramHelpCommand(message.Text, c.botUsername) && message.Caption == "" && message.Photo == nil && message.Voice == nil && message.Audio == nil && message.Document == nil {
+		if err := c.Send(ctx, bus.OutboundMessage{Channel: "telegram", ChatID: fmt.Sprintf("%d", message.Chat.ID), Content: helpMessage}); err != nil {
+			logger.WarnCF("telegram", "Failed to send deterministic help", map[string]interface{}{"error": err.Error()})
+		}
+		return
+	}
 
 	content := ""
 	mediaPaths := []string{}
@@ -371,7 +382,7 @@ func (c *TelegramChannel) handleMessage(ctx context.Context, update telego.Updat
 
 	if isMention {
 		// Thinking indicator
-		err := c.bot.SendChatAction(ctx, tu.ChatAction(tu.ID(chatID), telego.ChatActionTyping))
+		err := c.sendChatAction(ctx, chatID)
 		if err != nil {
 			logger.ErrorCF("telegram", "Failed to send chat action", map[string]interface{}{
 				"error": err.Error(),
@@ -407,6 +418,13 @@ func (c *TelegramChannel) handleMessage(ctx context.Context, update telego.Updat
 	}
 
 	c.HandleMessage(fmt.Sprintf("%d", user.ID), fmt.Sprintf("%d", chatID), content, mediaPaths, metadata)
+}
+
+func (c *TelegramChannel) sendChatAction(ctx context.Context, chatID int64) error {
+	if c.sendChatActionFn != nil {
+		return c.sendChatActionFn(ctx, chatID)
+	}
+	return c.bot.SendChatAction(ctx, tu.ChatAction(tu.ID(chatID), telego.ChatActionTyping))
 }
 
 func sendTelegramAttachment(ctx context.Context, bot *telego.Bot, chatID int64, attachment bus.OutboundAttachment) error {

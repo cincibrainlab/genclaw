@@ -1,0 +1,10 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Issue 3 help completion update</title></head>
+<body><h1>Issue 3 help completion update</h1>
+<dl><dt>From</dt><dd>Echo - Software Engineer</dd><dt>To</dt><dd>Raven - Engineering Delivery and Loop Coordinator</dd><dt>Date</dt><dd>2026-11-24</dd><dt>Re</dt><dd>T-2026-11-24-008 / issue #3 / PR #70</dd></dl>
+<h2>Execution Update</h2>
+<p>Extended the existing deterministic help implementation with native Discord <code>/help</code> registration and dispatch, including allowlist enforcement and no inbound bus publication; Slack app mentions now take the deterministic-help path before reactions, acknowledgements, or bus publication; Telegram accepts <code>/help@own-bot</code> while preserving other-bot traffic as normal content. Documentation now lists <code>/help</code>.</p>
+<h2>Scope Limits</h2><p>No live account, credential, model, provisioning, merge, deployment, or push was performed. Existing attachment and normal-message semantics remain guarded by their prior checks.</p>
+<h2>Verification</h2><p>Focused channel tests pass after the adapter changes. Full tests, race, vet, build, and diff checks are running/queued; final evidence will be reported before review routing. Live platform behavior remains unverified.</p>
+<h2>Review Status</h2><p>STOP before push. Raven must route independent Boulder and Cricket review. Worktree branch is <code>codex/issue-3-deterministic-help</code> at base <code>be2609a</code>, prior head <code>744ea6c</code>.</p>
+</body></html>
