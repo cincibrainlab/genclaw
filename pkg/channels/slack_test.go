@@ -48,6 +48,42 @@ func TestSlackAppMentionHelpPreservesAllowlistAndNormalTraffic(t *testing.T) {
 	}
 }
 
+func TestSlackDeniedMessageHelpDoesNothing(t *testing.T) {
+	mb := bus.NewMessageBus()
+	ch := &SlackChannel{BaseChannel: NewBaseChannel("slack", config.SlackConfig{}, mb, []string{"u1"}), ctx: context.Background(), botUserID: "bot-1"}
+	ch.setRunning(true)
+	sends, reactions := 0, 0
+	ch.sendFn = func(context.Context, bus.OutboundMessage) error { sends++; return nil }
+	ch.addReactionFn = func(string, string) { reactions++ }
+	ch.handleMessageEvent(&slackevents.MessageEvent{User: "denied", Channel: "C1", TimeStamp: "t1", Text: "help"})
+	if sends != 0 || reactions != 0 || lenPendingAcks(ch) != 0 {
+		t.Fatalf("denied message help sends=%d reactions=%d pending=%d", sends, reactions, lenPendingAcks(ch))
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if _, ok := mb.ConsumeInbound(ctx); ok {
+		t.Fatal("denied Slack message help must not publish inbound work")
+	}
+}
+
+func TestSlackDeniedAppMentionHelpDoesNothing(t *testing.T) {
+	mb := bus.NewMessageBus()
+	ch := &SlackChannel{BaseChannel: NewBaseChannel("slack", config.SlackConfig{}, mb, []string{"u1"}), ctx: context.Background(), botUserID: "bot-1"}
+	ch.setRunning(true)
+	sends, reactions := 0, 0
+	ch.sendFn = func(context.Context, bus.OutboundMessage) error { sends++; return nil }
+	ch.addReactionFn = func(string, string) { reactions++ }
+	ch.handleAppMention(&slackevents.AppMentionEvent{User: "denied", Channel: "C1", TimeStamp: "t1", Text: "<@bot-1> help"})
+	if sends != 0 || reactions != 0 || lenPendingAcks(ch) != 0 {
+		t.Fatalf("denied app mention help sends=%d reactions=%d pending=%d", sends, reactions, lenPendingAcks(ch))
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if _, ok := mb.ConsumeInbound(ctx); ok {
+		t.Fatal("denied Slack app mention help must not publish inbound work")
+	}
+}
+
 func TestSlackMessageEventHelpUsesExactOutboundTarget(t *testing.T) {
 	mb := bus.NewMessageBus()
 	ch := &SlackChannel{BaseChannel: NewBaseChannel("slack", config.SlackConfig{}, mb, []string{"u1"}), ctx: context.Background(), botUserID: "bot-1"}
