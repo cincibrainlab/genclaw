@@ -997,6 +997,12 @@ func (c *DiscordChannel) processIncomingMessage(_ *discordgo.Session, m *discord
 		}
 		content = strings.TrimSpace(content)
 	}
+	if !editOnly && len(m.Attachments) == 0 && isHelpCommand(content) {
+		if err := c.sendMessage(m.ChannelID, bus.OutboundMessage{Channel: "discord", ChatID: m.ChannelID, Content: helpMessage}); err != nil {
+			logger.WarnCF("discord", "Failed to send deterministic help", map[string]any{"error": err.Error()})
+		}
+		return
+	}
 	mediaPaths := make([]string, 0, len(m.Attachments))
 	localFiles := make([]string, 0, len(m.Attachments))
 

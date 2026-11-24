@@ -216,6 +216,14 @@ func (c *SlackChannel) handleMessageEvent(ev *slackevents.MessageEvent) {
 		chatID = channelID + "/" + threadTS
 	}
 
+	content := c.stripBotMention(ev.Text)
+	if (ev.Message == nil || len(ev.Message.Files) == 0) && isHelpCommand(content) {
+		if err := c.Send(c.ctx, bus.OutboundMessage{Channel: "slack", ChatID: chatID, Content: helpMessage}); err != nil {
+			logger.WarnCF("slack", "Failed to send deterministic help", map[string]interface{}{"error": err.Error()})
+		}
+		return
+	}
+
 	c.api.AddReaction("eyes", slack.ItemRef{
 		Channel:   channelID,
 		Timestamp: messageTS,
@@ -225,9 +233,6 @@ func (c *SlackChannel) handleMessageEvent(ev *slackevents.MessageEvent) {
 		ChannelID: channelID,
 		Timestamp: messageTS,
 	})
-
-	content := ev.Text
-	content = c.stripBotMention(content)
 
 	var mediaPaths []string
 	localFiles := []string{} // 跟踪需要清理的本地文件
@@ -363,6 +368,12 @@ func (c *SlackChannel) handleSlashCommand(event socketmode.Event) {
 	channelID := cmd.ChannelID
 	chatID := channelID
 	content := cmd.Text
+	if isHelpCommand(content) || strings.EqualFold(strings.TrimSpace(cmd.Command), "/help") {
+		if err := c.Send(c.ctx, bus.OutboundMessage{Channel: "slack", ChatID: chatID, Content: helpMessage}); err != nil {
+			logger.WarnCF("slack", "Failed to send deterministic help", map[string]interface{}{"error": err.Error()})
+		}
+		return
+	}
 
 	if strings.TrimSpace(content) == "" {
 		content = "help"

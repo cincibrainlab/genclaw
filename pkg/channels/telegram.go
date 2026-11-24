@@ -253,6 +253,12 @@ func (c *TelegramChannel) handleMessage(ctx context.Context, update telego.Updat
 			}
 		}
 	}
+	if isHelpCommand(message.Text) && message.Caption == "" && message.Photo == nil && message.Voice == nil && message.Audio == nil && message.Document == nil {
+		if err := c.Send(ctx, bus.OutboundMessage{Channel: "telegram", ChatID: fmt.Sprintf("%d", message.Chat.ID), Content: helpMessage}); err != nil {
+			logger.WarnCF("telegram", "Failed to send deterministic help", map[string]interface{}{"error": err.Error()})
+		}
+		return
+	}
 
 	content := ""
 	mediaPaths := []string{}
