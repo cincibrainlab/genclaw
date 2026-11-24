@@ -23,6 +23,8 @@
     <main class="wrap">
       <section>
         <h2>Frequently asked questions</h2>
+        <label for="faq-search">Search the FAQ</label>
+        <input id="faq-search" type="search" placeholder="Search questions and answers" autocomplete="off" />
         <div class="faq-item">
           <p class="faq-q">Do I need to know how to code?</p>
           <p class="faq-a">No. You chat with sciClaw through Telegram or Discord &mdash; the same apps you already use. No terminal required. A CLI is available for power users.</p>
@@ -76,5 +78,15 @@
         </div>
       </footer>
     </main>
+    <script>
+      const search = document.getElementById('faq-search');
+      const items = [...document.querySelectorAll('.faq-item')];
+      search.addEventListener('input', () => {
+        const query = search.value.trim().toLowerCase();
+        items.forEach((item) => {
+          item.hidden = query !== '' && !item.textContent.toLowerCase().includes(query);
+        });
+      });
+    </script>
   </body>
 </html>
