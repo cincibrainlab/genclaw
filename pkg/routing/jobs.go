@@ -121,13 +121,18 @@ type jobStore struct {
 }
 
 type activeJob struct {
-	mu       sync.RWMutex
-	record   JobRecord
-	cancel   context.CancelFunc
-	ctx      context.Context
-	target   LoopTarget
-	msg      bus.InboundMessage
-	prepared bool
+	mu                  sync.RWMutex
+	record              JobRecord
+	cancel              context.CancelFunc
+	ctx                 context.Context
+	target              LoopTarget
+	msg                 bus.InboundMessage
+	prepared            bool
+	progressMu          sync.Mutex
+	progressWorking     bool
+	progressPending     bool
+	progressInitial     *JobRecord
+	progressInitialSeen bool
 }
 
 type targetActiveJobs struct {
@@ -549,6 +554,10 @@ func (jm *JobManager) Submit(ctx context.Context, target LoopTarget, msg bus.Inb
 }
 
 func (jm *JobManager) sendQueuedStatusAsync(ctx context.Context, active *activeJob, running JobRecord, position int) bool {
+	if jm.progress != nil {
+		record := active.snapshot()
+		return jm.queueProgress(active, record)
+	}
 	select {
 	case jm.statusSlots <- struct{}{}:
 	default:
@@ -557,6 +566,113 @@ func (jm *JobManager) sendQueuedStatusAsync(ctx context.Context, active *activeJ
 	}
 	jm.sendQueuedStatusReserved(ctx, active, running, position)
 	return true
+}
+
+// queueProgress coalesces all active-job updates behind the actual messenger call.
+func (jm *JobManager) queueProgress(job *activeJob, initial ...JobRecord) bool {
+	job.progressMu.Lock()
+	defer job.progressMu.Unlock()
+	if !job.progressInitialSeen && len(initial) > 0 {
+		job.progressInitialSeen = true
+		if initial[0].State == JobStateQueued {
+			record := initial[0]
+			job.progressInitial = &record
+		}
+	}
+	job.progressPending = true
+	if job.progressWorking {
+		return true
+	}
+	select {
+	case jm.statusSlots <- struct{}{}:
+	default:
+		job.progressPending = false
+		logger.WarnCF("jobs", "Progress worker capacity exhausted", map[string]interface{}{"job_id": job.snapshot().ID})
+		return false
+	}
+	job.progressWorking = true
+	go jm.runProgressWorker(job)
+	return true
+}
+
+func (jm *JobManager) runProgressWorker(job *activeJob) {
+	defer func() { <-jm.statusSlots }()
+	for {
+		job.progressMu.Lock()
+		if !job.progressPending {
+			job.progressWorking = false
+			job.progressMu.Unlock()
+			return
+		}
+		job.progressPending = false
+		record := job.snapshot()
+		if job.progressInitial != nil {
+			if record.State == JobStateQueued || record.State == JobStateRunning {
+				initial := *job.progressInitial
+				initial.StatusMessageID = record.StatusMessageID
+				record = initial
+			}
+			job.progressInitial = nil
+		}
+		job.progressMu.Unlock()
+
+		message := formatProgressOutbound(record)
+		message.Channel, message.ChatID = record.Channel, record.ChatID
+		bounded := jm.progress.(*boundedProgress)
+		select {
+		case bounded.slots <- struct{}{}:
+		default:
+			logger.WarnCF("jobs", "Progress capacity exhausted", map[string]interface{}{"job_id": record.ID})
+			job.progressMu.Lock()
+			job.progressWorking = false
+			job.progressPending = false
+			job.progressMu.Unlock()
+			jm.progressFailureNotice(job.snapshot())
+			return
+		}
+		// ponytail: a messenger that ignores cancellation holds this slot until it
+		// returns; isolate the transport in a killable process if this is unacceptable.
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		id, err := bounded.next.SendOrEditProgress(ctx, record.Channel, record.ChatID, record.StatusMessageID, message)
+		cancel()
+		<-bounded.slots
+		changedDuringSend := false
+		if err != nil {
+			logger.WarnCF("jobs", "Failed to send progress update", map[string]interface{}{"job_id": record.ID, "error": err.Error()})
+			jm.progressFailureNotice(job.snapshot())
+		} else if id = strings.TrimSpace(id); id != "" && id != record.StatusMessageID {
+			record = job.update(func(existing *JobRecord) {
+				changedDuringSend = existing.revision != record.revision
+				if existing.StatusMessageID == record.StatusMessageID {
+					existing.StatusMessageID = id
+				}
+			})
+			if err := jm.store.Save(record); err != nil {
+				logger.WarnCF("jobs", "Failed to persist progress message id", map[string]interface{}{"job_id": record.ID, "error": err.Error()})
+				job.progressMu.Lock()
+				job.progressWorking = false
+				job.progressPending = false
+				job.progressMu.Unlock()
+				jm.progressFailureNotice(job.snapshot())
+				return
+			}
+		}
+		if current := job.snapshot(); changedDuringSend || current.revision != record.revision {
+			job.progressMu.Lock()
+			job.progressPending = true
+			job.progressMu.Unlock()
+		}
+	}
+}
+
+func (jm *JobManager) progressFailureNotice(record JobRecord) {
+	content := "Could not send a job status card; use status " + record.ShortID + " to check the job."
+	if record.State == JobStateCancelled {
+		content = fmt.Sprintf("Job %s was cancelled.", record.ShortID)
+	} else if record.State == JobStateDone || record.State == JobStateFailed {
+		content = fmt.Sprintf("Job %s latest state: %s. Could not update its status card; check the job result.", record.ShortID, record.State)
+	}
+	_ = publishJobResponse(context.Background(), jm.bus, bus.OutboundMessage{Channel: record.Channel, ChatID: record.ChatID, Content: content}, "Job status failure notice dropped")
 }
 
 func (jm *JobManager) sendQueuedStatusReserved(ctx context.Context, active *activeJob, running JobRecord, position int) {
@@ -911,6 +1027,7 @@ func (jm *JobManager) cancelQueuedJob(targetKey, jobID string) (JobRecord, error
 	jm.mu.Unlock()
 
 	if saveErr != nil {
+		jm.sendQueuedStatusAsync(context.Background(), job, JobRecord{}, 0)
 		if cancelErr != nil {
 			return record, cancellationSaveError{cancelErr}
 		}
@@ -988,13 +1105,8 @@ func (jm *JobManager) prepareJob(active *activeJob) {
 			_ = publishJobResponse(context.Background(), jm.bus, bus.OutboundMessage{Channel: record.Channel, ChatID: record.ChatID, Content: "Cancellation could not be saved; check the job after restart."}, "Cancellation persistence notice dropped")
 			return
 		}
-		if jm.progress != nil && strings.TrimSpace(record.StatusMessageID) != "" {
-			noticeCtx, cancel := context.WithTimeout(context.Background(), time.Second)
-			_, err := jm.syncTrackedJobProgress(noticeCtx, active)
-			cancel()
-			if err == nil {
-				return
-			}
+		if jm.progress != nil && jm.queueProgress(active) {
+			return
 		}
 		_ = publishJobResponse(context.Background(), jm.bus, bus.OutboundMessage{Channel: record.Channel, ChatID: record.ChatID, Content: fmt.Sprintf("Job %s was cancelled.", record.ShortID)}, "Cancellation notice dropped")
 		return
@@ -1012,6 +1124,7 @@ func (jm *JobManager) prepareJob(active *activeJob) {
 			delete(jm.active, target.key())
 		}
 		jm.mu.Unlock()
+		jm.sendQueuedStatusAsync(context.Background(), active, JobRecord{}, 0)
 		logger.WarnCF("jobs", "Failed to persist prepared job", map[string]interface{}{"job_id": record.ID, "error": err.Error()})
 		noticeCtx, cancel := context.WithTimeout(context.Background(), time.Second)
 		defer cancel()
@@ -1476,23 +1589,8 @@ func (p *progressReporter) sendLocked(record JobRecord) {
 		return
 	}
 
-	message := formatProgressOutbound(record)
-	message.Channel = record.Channel
-	message.ChatID = record.ChatID
-	messageID, err := p.manager.progress.SendOrEditProgress(p.ctx, record.Channel, record.ChatID, record.StatusMessageID, message)
-	if err != nil {
-		logger.WarnCF("jobs", "Failed to send progress update", map[string]interface{}{"job_id": record.ID, "error": err.Error()})
-		return
-	}
-	if strings.TrimSpace(messageID) != "" && strings.TrimSpace(messageID) != record.StatusMessageID {
-		record = p.active.update(func(existing *JobRecord) {
-			if existing.StatusMessageID == record.StatusMessageID {
-				existing.StatusMessageID = strings.TrimSpace(messageID)
-			}
-		})
-		if err := p.manager.store.Save(record); err != nil {
-			logger.WarnCF("jobs", "Failed to persist progress message id", map[string]interface{}{"job_id": record.ID, "error": err.Error()})
-		}
+	if !p.manager.queueProgress(p.active) && record.State != JobStateQueued && record.State != JobStateRunning {
+		p.manager.progressFailureNotice(record)
 	}
 	p.lastSent = time.Now()
 }
@@ -1681,13 +1779,11 @@ func formatDiscordRelativeTimestamp(startedAtMillis int64) string {
 	return fmt.Sprintf("<t:%d:R>", startedAtMillis/1000)
 }
 
-var jobCardNow = time.Now
-
 func formatJobElapsed(startedAtMillis int64) string {
 	if startedAtMillis <= 0 {
 		return "just now"
 	}
-	elapsed := jobCardNow().Sub(time.UnixMilli(startedAtMillis))
+	elapsed := time.Since(time.UnixMilli(startedAtMillis))
 	if elapsed < 0 {
 		elapsed = 0
 	}
