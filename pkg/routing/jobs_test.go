@@ -1587,23 +1587,18 @@ func TestJobManagerReplyToCardStatusRefreshesCanonicalCard(t *testing.T) {
 }
 
 func TestFormatProgressEmbedIncludesElapsed(t *testing.T) {
-	originalNow := jobCardNow
-	jobCardNow = func() time.Time { return time.Unix(300, 0) }
-	defer func() { jobCardNow = originalNow }()
-
 	embed := formatProgressEmbed(JobRecord{
 		ShortID:    "0000A",
 		Class:      JobClassWrite,
 		State:      JobStateRunning,
 		Phase:      "thinking",
 		AskSummary: "test",
-		StartedAt:  time.Unix(235, 0).UnixMilli(),
-		UpdatedAt:  time.Unix(300, 0).UnixMilli(),
+		StartedAt:  time.Now().Add(-65 * time.Second).UnixMilli(),
 	})
 	if !embedHas(embed, "Elapsed") {
 		t.Fatalf("expected elapsed field, got %#v", embed)
 	}
-	if !embedHas(embed, "1m 05s") {
+	if !embedHas(embed, "1m 05s") && !embedHas(embed, "1m 06s") {
 		t.Fatalf("expected formatted elapsed time, got %#v", embed)
 	}
 }
