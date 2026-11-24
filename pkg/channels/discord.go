@@ -64,6 +64,7 @@ type DiscordChannel struct {
 	sendFileFn            func(channelID, content string, attachment bus.OutboundAttachment) error
 	sendTypingFn          func(channelID string) error
 	startThreadFn         func(channelID, messageID, name string) (*discordgo.Channel, error)
+	routeCheckFn          func(bus.InboundMessage) bool
 	editMessageFn         func(channelID, messageID string, msg bus.OutboundMessage) error
 	interactionRespondFn  func(interaction *discordgo.Interaction, resp *discordgo.InteractionResponse) error
 	interactionEditFn     func(interaction *discordgo.Interaction, edit *discordgo.WebhookEdit) error
@@ -229,6 +230,13 @@ func (c *DiscordChannel) shouldDropDuplicateInbound(messageID, content string, m
 
 func (c *DiscordChannel) SetTranscriber(transcriber *voice.GroqTranscriber) {
 	c.transcriber = transcriber
+}
+
+// SetRouteCheck lets the gateway validate a top-level request before creating
+// a public thread. The message is still published when rejected so the router
+// can emit its normal inline deny/mention-only behavior.
+func (c *DiscordChannel) SetRouteCheck(fn func(bus.InboundMessage) bool) {
+	c.routeCheckFn = fn
 }
 
 func (c *DiscordChannel) SetSlashSkillCatalogCallback(cb func(channelID, guildID, userID string) ([]SlashSkillChoice, error)) {
@@ -683,6 +691,17 @@ func (c *DiscordChannel) isThreadChannel(channelID string) bool {
 	return err == nil && channel != nil && channel.IsThread()
 }
 
+func (c *DiscordChannel) parentChannelID(channelID string) string {
+	if strings.TrimSpace(channelID) == "" || c.session == nil || c.session.State == nil {
+		return ""
+	}
+	channel, err := c.session.State.Channel(channelID)
+	if err != nil || channel == nil || !channel.IsThread() {
+		return ""
+	}
+	return strings.TrimSpace(channel.ParentID)
+}
+
 func discordThreadName(content string) string {
 	content = strings.Join(strings.Fields(content), " ")
 	if content == "" {
@@ -1115,11 +1134,6 @@ func (c *DiscordChannel) processIncomingMessage(_ *discordgo.Session, m *discord
 	if content == "" {
 		content = "[media only]"
 	}
-	chatID := m.ChannelID
-	if !editOnly {
-		chatID = c.threadForTopLevelMessage(m)
-	}
-
 	if c.shouldDropDuplicateInbound(m.ID, content, mediaPaths, hasDirectMention, replyToBot) {
 		logger.InfoCF("discord", "Dropping duplicate inbound message event", map[string]any{
 			"message_id": m.ID,
@@ -1130,16 +1144,14 @@ func (c *DiscordChannel) processIncomingMessage(_ *discordgo.Session, m *discord
 		return
 	}
 
+	chatID := m.ChannelID
+
 	logger.DebugCF("discord", "Received message", map[string]any{
 		"sender_name": senderName,
 		"sender_id":   senderID,
 		"preview":     utils.Truncate(content, 50),
 		"is_edit":     editOnly,
 	})
-	if isMention {
-		c.startTyping(chatID)
-	}
-
 	metadata := map[string]string{
 		"message_id":         m.ID,
 		"user_id":            senderID,
@@ -1153,6 +1165,37 @@ func (c *DiscordChannel) processIncomingMessage(_ *discordgo.Session, m *discord
 		"has_direct_mention": fmt.Sprintf("%t", hasDirectMention),
 		"reply_to_bot":       fmt.Sprintf("%t", replyToBot),
 		"is_edit":            fmt.Sprintf("%t", editOnly),
+	}
+	if parentID := c.parentChannelID(m.ChannelID); parentID != "" {
+		metadata["parent_channel_id"] = parentID
+		metadata["is_thread"] = "true"
+	}
+	if !editOnly && c.routeCheckFn != nil {
+		accepted := c.routeCheckFn(bus.InboundMessage{
+			Channel:  "discord",
+			ChatID:   m.ChannelID,
+			SenderID: senderID,
+			Content:  content,
+			Media:    mediaPaths,
+			Metadata: metadata,
+		})
+		if accepted {
+			chatID = c.threadForTopLevelMessage(m)
+			if chatID != m.ChannelID {
+				metadata["parent_channel_id"] = m.ChannelID
+				metadata["is_thread"] = "true"
+			}
+		}
+	} else if !editOnly {
+		chatID = c.threadForTopLevelMessage(m)
+		if chatID != m.ChannelID {
+			metadata["parent_channel_id"] = m.ChannelID
+			metadata["is_thread"] = "true"
+		}
+	}
+	metadata["channel_id"] = chatID
+	if isMention {
+		c.startTyping(chatID)
 	}
 	if m.MessageReference != nil {
 		metadata["reply_message_id"] = strings.TrimSpace(m.MessageReference.MessageID)

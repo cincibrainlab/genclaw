@@ -7,12 +7,14 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/bwmarrin/discordgo"
 	"github.com/sipeed/picoclaw/pkg/bus"
 	"github.com/sipeed/picoclaw/pkg/config"
+	"github.com/sipeed/picoclaw/pkg/routing"
 )
 
 func newTestDiscordChannel() *DiscordChannel {
@@ -68,6 +70,163 @@ func TestDiscordThreadForTopLevelMessageFallsBackInline(t *testing.T) {
 	m := &discordgo.Message{ID: "msg-1", ChannelID: "channel-1", GuildID: "guild-1", Content: "request"}
 	if got := ch.threadForTopLevelMessage(m); got != m.ChannelID {
 		t.Fatalf("threadForTopLevelMessage() = %q, want inline channel %q", got, m.ChannelID)
+	}
+}
+
+func TestDiscordTopLevelThreadCreationHappensAfterDeduplication(t *testing.T) {
+	mb := bus.NewMessageBus()
+	ch := &DiscordChannel{
+		BaseChannel:   NewBaseChannel("discord", config.DiscordConfig{}, mb, nil),
+		ctx:           context.Background(),
+		typing:        make(map[string]*typingState),
+		botUserID:     "bot-1",
+		recentInbound: make(map[string]inboundMessageFingerprint),
+	}
+	ch.sendTypingFn = func(string) error { return nil }
+	created := 0
+	ch.startThreadFn = func(channelID, messageID, name string) (*discordgo.Channel, error) {
+		created++
+		return &discordgo.Channel{ID: "thread-1"}, nil
+	}
+	ch.setRunning(true)
+	s := newTestSession("bot-1")
+	m := &discordgo.Message{
+		ID: "msg-1", ChannelID: "channel-1", GuildID: "guild-1", Content: "hello",
+		Author: &discordgo.User{ID: "user-1", Username: "tester"},
+	}
+
+	ch.processIncomingMessage(s, m, false)
+	ch.processIncomingMessage(s, m, false)
+
+	if created != 1 {
+		t.Fatalf("thread creations = %d, want 1", created)
+	}
+	in, ok := mb.ConsumeInbound(context.Background())
+	if !ok || in.ChatID != "thread-1" {
+		t.Fatalf("inbound = %+v, ok=%t; want one message routed to thread-1", in, ok)
+	}
+}
+
+func TestDiscordTopLevelThreadCreationRequiresAcceptedRoute(t *testing.T) {
+	ch := newTestDiscordChannel()
+	created := 0
+	ch.startThreadFn = func(channelID, messageID, name string) (*discordgo.Channel, error) {
+		created++
+		return &discordgo.Channel{ID: "thread-1"}, nil
+	}
+	ch.routeCheckFn = func(bus.InboundMessage) bool { return false }
+	msg := &discordgo.Message{
+		ID: "msg-route", ChannelID: "channel-1", GuildID: "guild-1", Content: "hello",
+		Author: &discordgo.User{ID: "user-1", Username: "tester"},
+	}
+
+	ch.processIncomingMessage(newTestSession("bot-1"), msg, false)
+	if created != 0 {
+		t.Fatalf("thread creations = %d, want 0 for rejected route", created)
+	}
+}
+
+func TestDiscordCreatedThreadCarriesParentRoutingContext(t *testing.T) {
+	workspace := t.TempDir()
+	cfg := config.DefaultConfig()
+	cfg.Routing.Enabled = true
+	cfg.Routing.Mappings = []config.RoutingMapping{{
+		Channel: "discord", ChatID: "channel-1", Workspace: workspace, AllowedSenders: []string{"user-1"}, RequireMention: func() *bool { v := false; return &v }(),
+	}}
+	resolver, err := routing.NewResolver(cfg)
+	if err != nil {
+		t.Fatalf("NewResolver: %v", err)
+	}
+	mb := bus.NewMessageBus()
+	ch := &DiscordChannel{
+		BaseChannel: NewBaseChannel("discord", config.DiscordConfig{}, mb, nil),
+		ctx:         context.Background(), typing: make(map[string]*typingState),
+		recentInbound: make(map[string]inboundMessageFingerprint),
+	}
+	ch.routeCheckFn = func(msg bus.InboundMessage) bool { return resolver.Resolve(msg).Allowed }
+	ch.startThreadFn = func(channelID, messageID, name string) (*discordgo.Channel, error) {
+		return &discordgo.Channel{ID: "thread-1"}, nil
+	}
+	s := newTestSession("bot-1")
+	s.State = discordgo.NewState()
+	s.State.User = &discordgo.User{ID: "bot-1"}
+	if err := s.State.GuildAdd(&discordgo.Guild{ID: "guild-1"}); err != nil {
+		t.Fatalf("GuildAdd: %v", err)
+	}
+	if err := s.State.ChannelAdd(&discordgo.Channel{ID: "thread-1", GuildID: "guild-1", Type: discordgo.ChannelTypeGuildPublicThread, ParentID: "channel-1"}); err != nil {
+		t.Fatalf("ChannelAdd: %v", err)
+	}
+	msg := &discordgo.Message{ID: "created", ChannelID: "channel-1", GuildID: "guild-1", Content: "request", Author: &discordgo.User{ID: "user-1"}}
+	ch.session = s
+	ch.processIncomingMessage(s, msg, false)
+	first, ok := mb.ConsumeInbound(context.Background())
+	if !ok || first.ChatID != "thread-1" || first.Metadata["parent_channel_id"] != "channel-1" || first.Metadata["is_thread"] != "true" {
+		t.Fatalf("created-thread inbound = %+v, ok=%t", first, ok)
+	}
+	decision := resolver.Resolve(first)
+	if !decision.Allowed || decision.Workspace != workspace || !strings.HasPrefix(decision.SessionKey, "discord:thread-1@") {
+		t.Fatalf("first request routing = %+v", decision)
+	}
+	followup := &discordgo.Message{ID: "followup", ChannelID: "thread-1", GuildID: "guild-1", Content: "follow up", Author: &discordgo.User{ID: "user-1"}}
+	ch.processIncomingMessage(s, followup, false)
+	second, ok := mb.ConsumeInbound(context.Background())
+	if !ok || second.ChatID != "thread-1" || second.Metadata["parent_channel_id"] != "channel-1" || second.Metadata["is_thread"] != "true" {
+		t.Fatalf("cached-thread inbound = %+v, ok=%t", second, ok)
+	}
+	if followupDecision := resolver.Resolve(second); !followupDecision.Allowed || followupDecision.Workspace != workspace {
+		t.Fatalf("follow-up routing = %+v", followupDecision)
+	}
+}
+
+func TestDiscordConcurrentDuplicateCreatesOneThread(t *testing.T) {
+	ch := newTestDiscordChannel()
+	ch.recentInbound = make(map[string]inboundMessageFingerprint)
+	var created atomic.Int32
+	ch.startThreadFn = func(channelID, messageID, name string) (*discordgo.Channel, error) {
+		created.Add(1)
+		return &discordgo.Channel{ID: "thread-1"}, nil
+	}
+	msg := &discordgo.Message{ID: "msg-concurrent", ChannelID: "channel-1", GuildID: "guild-1", Content: "hello", Author: &discordgo.User{ID: "user-1"}}
+	var wg sync.WaitGroup
+	for range 2 {
+		wg.Add(1)
+		go func() { defer wg.Done(); ch.processIncomingMessage(newTestSession("bot-1"), msg, false) }()
+	}
+	wg.Wait()
+	if got := created.Load(); got != 1 {
+		t.Fatalf("thread creations = %d, want 1", got)
+	}
+}
+
+func TestDiscordDMAndExistingThreadDoNotCreatePublicThread(t *testing.T) {
+	ch := newTestDiscordChannel()
+	created := 0
+	ch.startThreadFn = func(channelID, messageID, name string) (*discordgo.Channel, error) {
+		created++
+		return &discordgo.Channel{ID: "new-thread"}, nil
+	}
+	s := newTestSession("bot-1")
+	s.State = discordgo.NewState()
+	s.State.User = &discordgo.User{ID: "bot-1"}
+	if err := s.State.GuildAdd(&discordgo.Guild{ID: "guild-1"}); err != nil {
+		t.Fatalf("GuildAdd: %v", err)
+	}
+	if err := s.State.ChannelAdd(&discordgo.Channel{ID: "thread-1", GuildID: "guild-1", Type: discordgo.ChannelTypeGuildPublicThread, ParentID: "parent-1"}); err != nil {
+		t.Fatalf("ChannelAdd: %v", err)
+	}
+	ch.session = s
+	ch.processIncomingMessage(s, &discordgo.Message{ID: "dm", ChannelID: "dm-1", Content: "hello", Author: &discordgo.User{ID: "user-1"}}, false)
+	ch.processIncomingMessage(s, &discordgo.Message{ID: "followup", ChannelID: "thread-1", GuildID: "guild-1", Content: "follow up", Author: &discordgo.User{ID: "user-1"}}, false)
+	if created != 0 {
+		t.Fatalf("thread creations = %d, want 0 for DM/existing thread", created)
+	}
+	first, ok := ch.bus.ConsumeInbound(context.Background())
+	if !ok || first.ChatID != "dm-1" {
+		t.Fatalf("DM inbound = %+v, ok=%t", first, ok)
+	}
+	second, ok := ch.bus.ConsumeInbound(context.Background())
+	if !ok || second.ChatID != "thread-1" || second.Metadata["parent_channel_id"] != "parent-1" || second.Metadata["is_thread"] != "true" {
+		t.Fatalf("thread inbound = %+v, ok=%t", second, ok)
 	}
 }
 
