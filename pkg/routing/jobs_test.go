@@ -76,6 +76,12 @@ func (m *fakeProgressMessenger) SendOrEditProgress(_ context.Context, channelNam
 	return id, nil
 }
 
+func (m *fakeProgressMessenger) snapshotMessages() []fakeProgressCall {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]fakeProgressCall(nil), m.messages...)
+}
+
 type fakeJobRunner struct {
 	started chan struct{}
 	block   chan struct{}
@@ -924,7 +930,7 @@ func TestJobManagerReplyToCardStatusRefreshesCanonicalCard(t *testing.T) {
 
 	jm.mu.Lock()
 	statusID := jm.active[target.key()].write.snapshot().StatusMessageID
-	before := len(progress.messages)
+	before := len(progress.snapshotMessages())
 	jm.mu.Unlock()
 
 	if err := jm.Submit(context.Background(), target, bus.InboundMessage{
@@ -936,8 +942,9 @@ func TestJobManagerReplyToCardStatusRefreshesCanonicalCard(t *testing.T) {
 		t.Fatalf("reply status submit: %v", err)
 	}
 	assertNoOutbound(t, mb)
-	if len(progress.messages) <= before {
-		t.Fatalf("expected canonical card refresh, before=%d after=%d", before, len(progress.messages))
+	after := len(progress.snapshotMessages())
+	if after <= before {
+		t.Fatalf("expected canonical card refresh, before=%d after=%d", before, after)
 	}
 
 	close(runner.block)
