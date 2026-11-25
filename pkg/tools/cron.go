@@ -16,10 +16,15 @@ type JobExecutor interface {
 	ProcessDirectWithChannel(ctx context.Context, content, sessionKey, channel, chatID, senderID string) (string, error)
 }
 
+// SyntheticJobExecutor is required for scheduled jobs processed by an agent.
+type SyntheticJobExecutor interface {
+	ProcessSyntheticWithChannel(ctx context.Context, content, sessionKey, channel, chatID, senderID string) (string, error)
+}
+
 // CronTool provides scheduling capabilities for the agent
 type CronTool struct {
 	cronService *cron.CronService
-	executor    JobExecutor
+	executor    SyntheticJobExecutor
 	msgBus      *bus.MessageBus
 	execTool    *ExecTool
 	channel     string
@@ -28,7 +33,7 @@ type CronTool struct {
 }
 
 // NewCronTool creates a new CronTool
-func NewCronTool(cronService *cron.CronService, executor JobExecutor, msgBus *bus.MessageBus, workspace string, restrict bool) *CronTool {
+func NewCronTool(cronService *cron.CronService, executor SyntheticJobExecutor, msgBus *bus.MessageBus, workspace string, restrict bool) *CronTool {
 	return &CronTool{
 		cronService: cronService,
 		executor:    executor,
@@ -309,8 +314,11 @@ func (t *CronTool) ExecuteJob(ctx context.Context, job *cron.CronJob) string {
 	sessionKey := fmt.Sprintf("cron-%s", job.ID)
 
 	// Call agent with job's message
-	response, err := t.executor.ProcessDirectWithChannel(
-		ctx,
+	if t.executor == nil {
+		return "Error: scheduled agent execution requires synthetic sender support"
+	}
+	response, err := t.executor.ProcessSyntheticWithChannel(
+		WithSenderIdentity(ctx, "", ""),
 		job.Payload.Message,
 		sessionKey,
 		channel,
