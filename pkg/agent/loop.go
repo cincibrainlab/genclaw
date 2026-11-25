@@ -563,7 +563,6 @@ func (al *AgentLoop) Stop() {
 // HandleInbound processes one inbound message and publishes any response.
 // It is used both by the default bus consumer loop and routed dispatchers.
 func (al *AgentLoop) HandleInbound(ctx context.Context, msg bus.InboundMessage) {
-	ctx = tools.WithoutSyntheticSender(ctx)
 	response, media, err := al.processMessageWithMedia(ctx, msg, nil)
 	var outboundError *bus.OutboundError
 	if err != nil && strings.TrimSpace(response) == "" {
@@ -593,7 +592,6 @@ func (al *AgentLoop) HandleInbound(ctx context.Context, msg bus.InboundMessage) 
 }
 
 func (al *AgentLoop) RunJob(ctx context.Context, msg bus.InboundMessage, onProgress func(phase, detail string)) (string, error) {
-	ctx = tools.WithoutSyntheticSender(ctx)
 	response, media, err := al.processMessageWithMedia(ctx, msg, onProgress)
 	var outboundError *bus.OutboundError
 	if err != nil && strings.TrimSpace(response) == "" {
@@ -685,16 +683,16 @@ func (al *AgentLoop) ProcessDirect(ctx context.Context, content, sessionKey stri
 }
 
 func (al *AgentLoop) ProcessDirectWithChannel(ctx context.Context, content, sessionKey, channel, chatID, senderID string) (string, error) {
-	return al.processDirectWithChannel(tools.WithoutSyntheticSender(ctx), content, sessionKey, channel, chatID, senderID)
+	return al.processDirectWithChannel(ctx, content, sessionKey, channel, chatID, senderID, false)
 }
 
 // ProcessSyntheticWithChannel preserves routing and profile values without
 // exposing the synthetic sender as an execution identity.
 func (al *AgentLoop) ProcessSyntheticWithChannel(ctx context.Context, content, sessionKey, channel, chatID, senderID string) (string, error) {
-	return al.processDirectWithChannel(tools.WithSyntheticSender(ctx), content, sessionKey, channel, chatID, senderID)
+	return al.processDirectWithChannel(ctx, content, sessionKey, channel, chatID, senderID, true)
 }
 
-func (al *AgentLoop) processDirectWithChannel(ctx context.Context, content, sessionKey, channel, chatID, senderID string) (string, error) {
+func (al *AgentLoop) processDirectWithChannel(ctx context.Context, content, sessionKey, channel, chatID, senderID string, synthetic bool) (string, error) {
 	msg := bus.InboundMessage{
 		Channel:    channel,
 		SenderID:   senderID,
@@ -703,7 +701,8 @@ func (al *AgentLoop) processDirectWithChannel(ctx context.Context, content, sess
 		SessionKey: sessionKey,
 	}
 
-	return al.processMessage(ctx, msg)
+	response, _, err := al.processMessageWithClassification(ctx, msg, nil, synthetic)
+	return response, err
 }
 
 // ProcessHeartbeat processes a heartbeat request without session history.
@@ -734,8 +733,12 @@ func (al *AgentLoop) processMessageWithProgress(ctx context.Context, msg bus.Inb
 }
 
 func (al *AgentLoop) processMessageWithMedia(ctx context.Context, msg bus.InboundMessage, onProgress func(phase, detail string)) (string, []bus.OutboundAttachment, error) {
+	return al.processMessageWithClassification(ctx, msg, onProgress, false)
+}
+
+func (al *AgentLoop) processMessageWithClassification(ctx context.Context, msg bus.InboundMessage, onProgress func(phase, detail string), synthetic bool) (string, []bus.OutboundAttachment, error) {
 	channel, sender := msg.Channel, msg.SenderID
-	if tools.IsSyntheticSender(ctx) || channel == "system" || channel == "maixcam" || (channel == "feishu" && sender == "unknown") {
+	if synthetic || channel == "system" || channel == "maixcam" || (channel == "feishu" && sender == "unknown") {
 		channel, sender = "", ""
 	}
 	ctx = tools.WithSenderIdentity(ctx, channel, sender)

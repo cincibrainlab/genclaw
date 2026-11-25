@@ -17,23 +17,6 @@ func (id SenderIdentity) QualifiedID() string {
 }
 
 type senderIdentityKey struct{}
-type syntheticSenderKey struct{}
-
-// WithSyntheticSender marks an execution that has no human sender.
-func WithSyntheticSender(ctx context.Context) context.Context {
-	return context.WithValue(ctx, syntheticSenderKey{}, true)
-}
-
-// WithoutSyntheticSender starts a new inbound execution independently of its parent.
-func WithoutSyntheticSender(ctx context.Context) context.Context {
-	return context.WithValue(ctx, syntheticSenderKey{}, false)
-}
-
-// IsSyntheticSender reports whether the execution was marked synthetic.
-func IsSyntheticSender(ctx context.Context) bool {
-	synthetic, _ := ctx.Value(syntheticSenderKey{}).(bool)
-	return synthetic
-}
 
 // WithSenderIdentity replaces any inherited identity, including when either
 // component is missing, so unrelated executions cannot inherit a sender.

@@ -11,11 +11,6 @@ import (
 	"github.com/sipeed/picoclaw/pkg/utils"
 )
 
-// JobExecutor is the interface for executing cron jobs through the agent
-type JobExecutor interface {
-	ProcessDirectWithChannel(ctx context.Context, content, sessionKey, channel, chatID, senderID string) (string, error)
-}
-
 // SyntheticJobExecutor is required for scheduled jobs processed by an agent.
 type SyntheticJobExecutor interface {
 	ProcessSyntheticWithChannel(ctx context.Context, content, sessionKey, channel, chatID, senderID string) (string, error)

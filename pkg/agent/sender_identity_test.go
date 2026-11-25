@@ -3,7 +3,6 @@ package agent
 import (
 	"context"
 	"fmt"
-	"reflect"
 	"testing"
 	"time"
 
@@ -15,17 +14,6 @@ import (
 )
 
 type identityProvider struct{}
-
-var _ tools.SyntheticJobExecutor = (*AgentLoop)(nil)
-var _ tools.SyntheticJobExecutor = (*syntheticCronExecutor)(nil)
-
-func TestCronConstructorRequiresSyntheticExecutor(t *testing.T) {
-	parameter := reflect.TypeOf(tools.NewCronTool).In(1)
-	required := reflect.TypeOf((*tools.SyntheticJobExecutor)(nil)).Elem()
-	if !parameter.Implements(required) {
-		t.Fatalf("cron executor parameter %v does not require %v", parameter, required)
-	}
-}
 
 type identityProfileRecorder struct{ ids []string }
 
@@ -64,56 +52,6 @@ func TestScheduledJobHasNoSenderIdentity(t *testing.T) {
 	}
 	if len(profiles.ids) != 1 || profiles.ids[0] != "fluxer:cron" {
 		t.Fatalf("scheduled profile lookups = %v, want [fluxer:cron]", profiles.ids)
-	}
-}
-
-type legacyCronWrapper struct{ loop *AgentLoop }
-
-func (w *legacyCronWrapper) ProcessDirectWithChannel(ctx context.Context, content, session, channel, chat, sender string) (string, error) {
-	return w.loop.ProcessDirectWithChannel(ctx, content, session, channel, chat, sender)
-}
-
-type legacyCronExecutor struct{}
-
-type syntheticCronExecutor struct {
-	inherited bool
-	sender    string
-}
-
-func (*syntheticCronExecutor) ProcessDirectWithChannel(context.Context, string, string, string, string, string) (string, error) {
-	return "", fmt.Errorf("unexpected direct call")
-}
-
-func (e *syntheticCronExecutor) ProcessSyntheticWithChannel(ctx context.Context, _, _, _, _, sender string) (string, error) {
-	_, e.inherited = tools.SenderIdentityFromContext(ctx)
-	e.sender = sender
-	return "ok", nil
-}
-
-func TestCronSyntheticExecutorReceivesNoInheritedIdentity(t *testing.T) {
-	executor := &syntheticCronExecutor{}
-	tool := tools.NewCronTool(nil, executor, nil, t.TempDir(), false)
-	job := &cron.CronJob{}
-	job.Payload.Channel, job.Payload.To, job.Payload.Message = "fluxer", "room", "hello"
-	ctx := tools.WithSenderIdentity(context.Background(), "fluxer", "inherited")
-	if got := tool.ExecuteJob(ctx, job); got != "ok" {
-		t.Fatalf("result = %q", got)
-	}
-	if executor.inherited || executor.sender != "cron" {
-		t.Fatalf("inherited identity = %v, sender = %q", executor.inherited, executor.sender)
-	}
-}
-
-func (*legacyCronExecutor) ProcessDirectWithChannel(context.Context, string, string, string, string, string) (string, error) {
-	return "executed", nil
-}
-
-func TestCronRejectsExecutorsWithoutSyntheticSupport(t *testing.T) {
-	required := reflect.TypeOf(tools.NewCronTool).In(1)
-	for _, executor := range []any{&legacyCronWrapper{}, &legacyCronExecutor{}} {
-		if reflect.TypeOf(executor).Implements(required) {
-			t.Errorf("%T unexpectedly satisfies constructor contract", executor)
-		}
 	}
 }
 
@@ -191,14 +129,14 @@ func TestSenderIdentityReachesToolAndDoesNotLeak(t *testing.T) {
 	}
 }
 
-func TestRunJobOverridesInheritedSyntheticMarker(t *testing.T) {
+func TestRunJobOverridesInheritedIdentity(t *testing.T) {
 	cfg := config.DefaultConfig()
 	cfg.Agents.Defaults.Workspace = t.TempDir()
 	al := NewAgentLoop(cfg, bus.NewMessageBus(), &identityProvider{})
 	defer al.Stop()
 	probe := &identityProbe{results: make(chan string, 1)}
 	al.RegisterTool(probe)
-	parent := tools.WithSyntheticSender(context.Background())
+	parent := tools.WithSenderIdentity(context.Background(), "old", "stale")
 	_, err := al.RunJob(parent, bus.InboundMessage{Channel: "fluxer", SenderID: "123", ChatID: "room", Content: "hello", SessionKey: "real-job"}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -212,14 +150,14 @@ func TestRunJobOverridesInheritedSyntheticMarker(t *testing.T) {
 	}
 }
 
-func TestDirectWithChannelOverridesInheritedSyntheticMarker(t *testing.T) {
+func TestDirectWithChannelOverridesInheritedIdentity(t *testing.T) {
 	cfg := config.DefaultConfig()
 	cfg.Agents.Defaults.Workspace = t.TempDir()
 	al := NewAgentLoop(cfg, bus.NewMessageBus(), &identityProvider{})
 	defer al.Stop()
 	probe := &identityProbe{results: make(chan string, 1)}
 	al.RegisterTool(probe)
-	parent := tools.WithSyntheticSender(context.Background())
+	parent := tools.WithSenderIdentity(context.Background(), "old", "stale")
 	_, err := al.ProcessDirectWithChannel(parent, "hello", "direct-real", "fluxer", "room", "123")
 	if err != nil {
 		t.Fatal(err)
@@ -346,63 +284,6 @@ func TestSpawnSenderIdentityIsolatedAcrossOverlappingTasks(t *testing.T) {
 			}
 		case <-ctx.Done():
 			t.Fatal("tasks did not complete")
-		}
-	}
-	if received["one:true/fluxer/one"] != 2 || received["two:true/fluxer/two"] != 2 || len(received) != 2 {
-		t.Fatalf("overlapping identities = %v", received)
-	}
-}
-
-type overlappingIdentityProbe struct {
-	entered chan string
-	release <-chan struct{}
-	job     string
-}
-
-func (*overlappingIdentityProbe) Name() string        { return "identity_probe" }
-func (*overlappingIdentityProbe) Description() string { return "Inspect execution identity" }
-func (*overlappingIdentityProbe) Parameters() map[string]interface{} {
-	return map[string]interface{}{"type": "object", "properties": map[string]interface{}{"sender": map[string]interface{}{"type": "string"}}}
-}
-func (p *overlappingIdentityProbe) Execute(ctx context.Context, _ map[string]interface{}) *tools.ToolResult {
-	id, ok := tools.SenderIdentityFromContext(ctx)
-	p.entered <- fmt.Sprintf("%s:%t/%s/%s", p.job, ok, id.Channel, id.RawID)
-	<-p.release
-	id, ok = tools.SenderIdentityFromContext(ctx)
-	p.entered <- fmt.Sprintf("%s:%t/%s/%s", p.job, ok, id.Channel, id.RawID)
-	return tools.SilentResult("ok")
-}
-
-func TestSenderIdentityIsolatedAcrossOverlappingAgentExecutions(t *testing.T) {
-	entered := make(chan string, 4)
-	release := make(chan struct{})
-	done := make(chan error, 2)
-	for _, raw := range []string{"one", "two"} {
-		cfg := config.DefaultConfig()
-		cfg.Agents.Defaults.Workspace = t.TempDir()
-		al := NewAgentLoop(cfg, bus.NewMessageBus(), &identityProvider{})
-		defer al.Stop()
-		al.RegisterTool(&overlappingIdentityProbe{entered: entered, release: release, job: raw})
-		go func(raw string) {
-			_, err := al.ProcessDirectWithChannel(context.Background(), "hello", raw, "fluxer", "room", raw)
-			done <- err
-		}(raw)
-	}
-	received := map[string]int{}
-	for i := 0; i < 2; i++ {
-		select {
-		case value := <-entered:
-			received[value]++
-		case <-time.After(10 * time.Second):
-			close(release)
-			t.Fatal("both tools did not overlap")
-		}
-	}
-	close(release)
-	for i := 0; i < 2; i++ {
-		received[<-entered]++
-		if err := <-done; err != nil {
-			t.Fatal(err)
 		}
 	}
 	if received["one:true/fluxer/one"] != 2 || received["two:true/fluxer/two"] != 2 || len(received) != 2 {
