@@ -270,6 +270,89 @@ func TestSubagentToolPreservesSenderIdentity(t *testing.T) {
 	}
 }
 
+type concurrentIdentityProvider struct{}
+
+func (*concurrentIdentityProvider) GetDefaultModel() string { return "test" }
+func (*concurrentIdentityProvider) Chat(_ context.Context, messages []providers.Message, _ []providers.ToolDefinition, _ string, _ map[string]interface{}) (*providers.LLMResponse, error) {
+	for _, m := range messages {
+		if m.Role == "tool" {
+			return &providers.LLMResponse{Content: "done"}, nil
+		}
+	}
+	return &providers.LLMResponse{ToolCalls: []providers.ToolCall{{ID: "1", Name: "identity_probe", Arguments: map[string]interface{}{"sender": messages[1].Content}}}}, nil
+}
+
+type concurrentIdentityProbe struct {
+	entered chan string
+	release <-chan struct{}
+}
+
+func (*concurrentIdentityProbe) Name() string        { return "identity_probe" }
+func (*concurrentIdentityProbe) Description() string { return "Inspect execution identity" }
+func (*concurrentIdentityProbe) Parameters() map[string]interface{} {
+	return map[string]interface{}{"type": "object", "properties": map[string]interface{}{"sender": map[string]interface{}{"type": "string"}}}
+}
+func (p *concurrentIdentityProbe) Execute(ctx context.Context, args map[string]interface{}) *tools.ToolResult {
+	record := func() {
+		id, ok := tools.SenderIdentityFromContext(ctx)
+		p.entered <- fmt.Sprintf("%s:%t/%s/%s", args["sender"], ok, id.Channel, id.RawID)
+	}
+	record()
+	select {
+	case <-p.release:
+	case <-ctx.Done():
+		return tools.ErrorResult("cancelled")
+	}
+	record()
+	return tools.SilentResult("ok")
+}
+
+func TestSpawnSenderIdentityIsolatedAcrossOverlappingTasks(t *testing.T) {
+	manager := tools.NewSubagentManager(&concurrentIdentityProvider{}, "test", t.TempDir(), nil)
+	entered := make(chan string, 4)
+	release := make(chan struct{})
+	manager.RegisterTool(&concurrentIdentityProbe{entered: entered, release: release})
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	done := make(chan *tools.ToolResult, 2)
+	for _, raw := range []string{"one", "two"} {
+		taskCtx := tools.WithSenderIdentity(ctx, "fluxer", raw)
+		_, err := manager.Spawn(taskCtx, raw, raw, "fluxer", "room", func(_ context.Context, result *tools.ToolResult) { done <- result })
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	received := map[string]int{}
+	for i := 0; i < 2; i++ {
+		select {
+		case value := <-entered:
+			received[value]++
+		case <-ctx.Done():
+			t.Fatal("both tasks did not overlap")
+		}
+	}
+	close(release)
+	for i := 0; i < 2; i++ {
+		select {
+		case value := <-entered:
+			received[value]++
+		case <-ctx.Done():
+			t.Fatal("tasks did not finish identity checks")
+		}
+		select {
+		case result := <-done:
+			if result.IsError {
+				t.Fatalf("task failed: %s", result.ForLLM)
+			}
+		case <-ctx.Done():
+			t.Fatal("tasks did not complete")
+		}
+	}
+	if received["one:true/fluxer/one"] != 2 || received["two:true/fluxer/two"] != 2 || len(received) != 2 {
+		t.Fatalf("overlapping identities = %v", received)
+	}
+}
+
 type overlappingIdentityProbe struct {
 	entered chan string
 	release <-chan struct{}
