@@ -1,0 +1,292 @@
+package agent
+
+import (
+	"context"
+	"fmt"
+	"testing"
+	"time"
+
+	"github.com/sipeed/picoclaw/pkg/bus"
+	"github.com/sipeed/picoclaw/pkg/config"
+	"github.com/sipeed/picoclaw/pkg/cron"
+	"github.com/sipeed/picoclaw/pkg/providers"
+	"github.com/sipeed/picoclaw/pkg/tools"
+)
+
+type identityProvider struct{}
+
+type identityProfileRecorder struct{ ids []string }
+
+func (r *identityProfileRecorder) AnswerTheme(id string) string {
+	r.ids = append(r.ids, id)
+	return ""
+}
+
+func (*identityProvider) GetDefaultModel() string { return "test" }
+func (*identityProvider) Chat(_ context.Context, messages []providers.Message, _ []providers.ToolDefinition, _ string, _ map[string]interface{}) (*providers.LLMResponse, error) {
+	for _, m := range messages {
+		if m.Role == "tool" {
+			return &providers.LLMResponse{Content: "done"}, nil
+		}
+	}
+	return &providers.LLMResponse{ToolCalls: []providers.ToolCall{{ID: "1", Name: "identity_probe", Arguments: map[string]interface{}{"sender": "forged"}}}}, nil
+}
+
+func TestScheduledJobHasNoSenderIdentity(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.Agents.Defaults.Workspace = t.TempDir()
+	al := NewAgentLoop(cfg, bus.NewMessageBus(), &identityProvider{})
+	defer al.Stop()
+	profiles := &identityProfileRecorder{}
+	al.SetProfileStore(profiles)
+	probe := &identityProbe{results: make(chan string, 1)}
+	al.RegisterTool(probe)
+	job := &cron.CronJob{}
+	job.Payload.Channel = "fluxer"
+	job.Payload.To = "room"
+	job.Payload.Message = "hello"
+	tool := tools.NewCronTool(nil, al, nil, cfg.Agents.Defaults.Workspace, false)
+	tool.ExecuteJob(tools.WithSenderIdentity(context.Background(), "fluxer", "inherited"), job)
+	if got := <-probe.results; got != "false///" {
+		t.Fatalf("scheduled job identity = %q", got)
+	}
+	if len(profiles.ids) != 1 || profiles.ids[0] != "fluxer:cron" {
+		t.Fatalf("scheduled profile lookups = %v, want [fluxer:cron]", profiles.ids)
+	}
+}
+
+func TestCronAllowsNilExecutor(t *testing.T) {
+	tool := tools.NewCronTool(nil, nil, nil, t.TempDir(), false)
+	if got := tool.ExecuteJob(context.Background(), &cron.CronJob{}); got != "Error: scheduled agent execution requires synthetic sender support" {
+		t.Fatalf("nil executor result = %q", got)
+	}
+}
+
+func TestDirectAndHeartbeatHaveNoSyntheticSenderIdentity(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.Agents.Defaults.Workspace = t.TempDir()
+	al := NewAgentLoop(cfg, bus.NewMessageBus(), &identityProvider{})
+	defer al.Stop()
+	profiles := &identityProfileRecorder{}
+	al.SetProfileStore(profiles)
+	probe := &identityProbe{results: make(chan string, 2)}
+	al.RegisterTool(probe)
+	parent := tools.WithSenderIdentity(context.Background(), "fluxer", "stale")
+	if _, err := al.ProcessDirect(parent, "hello", "direct-test"); err != nil {
+		t.Fatal(err)
+	}
+	if got := <-probe.results; got != "false///" {
+		t.Errorf("direct identity = %q", got)
+	}
+	if len(profiles.ids) != 1 || profiles.ids[0] != "cli:cli" {
+		t.Fatalf("direct profile lookups = %v, want [cli:cli]", profiles.ids)
+	}
+	if _, err := al.ProcessHeartbeat(parent, "hello", "fluxer", "room"); err != nil {
+		t.Fatal(err)
+	}
+	if got := <-probe.results; got != "false///" {
+		t.Errorf("heartbeat identity = %q", got)
+	}
+}
+
+type identityProbe struct{ results chan string }
+
+func (*identityProbe) Name() string        { return "identity_probe" }
+func (*identityProbe) Description() string { return "Inspect execution identity" }
+func (*identityProbe) Parameters() map[string]interface{} {
+	return map[string]interface{}{"type": "object", "properties": map[string]interface{}{"sender": map[string]interface{}{"type": "string"}}}
+}
+func (p *identityProbe) Execute(ctx context.Context, _ map[string]interface{}) *tools.ToolResult {
+	id, ok := tools.SenderIdentityFromContext(ctx)
+	p.results <- fmt.Sprintf("%t/%s/%s/%s", ok, id.Channel, id.RawID, id.QualifiedID())
+	return tools.SilentResult("ok")
+}
+
+func TestSenderIdentityReachesToolAndDoesNotLeak(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.Agents.Defaults.Workspace = t.TempDir()
+	al := NewAgentLoop(cfg, bus.NewMessageBus(), &identityProvider{})
+	defer al.Stop()
+	probe := &identityProbe{results: make(chan string, 4)}
+	al.RegisterTool(probe)
+
+	for _, tc := range []struct{ channel, sender, want string }{
+		{"fluxer", "123", "true/fluxer/123/fluxer:123"},
+		{"fluxer", "cron", "true/fluxer/cron/fluxer:cron"},
+		{"fluxer", "", "false///"},
+		{"discord", "other", "true/discord/other/discord:other"},
+		{"feishu", "unknown", "false///"},
+		{"maixcam", "maixcam", "false///"},
+	} {
+		parent := tools.WithSenderIdentity(context.Background(), "old", "stale")
+		_, err := al.RunJob(parent, bus.InboundMessage{Channel: tc.channel, SenderID: tc.sender, ChatID: "room", Content: "hello", SessionKey: tc.channel + tc.sender}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := <-probe.results; got != tc.want {
+			t.Errorf("got %q, want %q", got, tc.want)
+		}
+	}
+}
+
+func TestRunJobOverridesInheritedIdentity(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.Agents.Defaults.Workspace = t.TempDir()
+	al := NewAgentLoop(cfg, bus.NewMessageBus(), &identityProvider{})
+	defer al.Stop()
+	probe := &identityProbe{results: make(chan string, 1)}
+	al.RegisterTool(probe)
+	parent := tools.WithSenderIdentity(context.Background(), "old", "stale")
+	_, err := al.RunJob(parent, bus.InboundMessage{Channel: "fluxer", SenderID: "123", ChatID: "room", Content: "hello", SessionKey: "real-job"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := <-probe.results; got != "true/fluxer/123/fluxer:123" {
+		t.Fatalf("real job identity = %q", got)
+	}
+	al.HandleInbound(parent, bus.InboundMessage{Channel: "fluxer", SenderID: "456", ChatID: "room", Content: "hello", SessionKey: "inbound-job"})
+	if got := <-probe.results; got != "true/fluxer/456/fluxer:456" {
+		t.Fatalf("inbound job identity = %q", got)
+	}
+}
+
+func TestDirectWithChannelOverridesInheritedIdentity(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.Agents.Defaults.Workspace = t.TempDir()
+	al := NewAgentLoop(cfg, bus.NewMessageBus(), &identityProvider{})
+	defer al.Stop()
+	probe := &identityProbe{results: make(chan string, 1)}
+	al.RegisterTool(probe)
+	parent := tools.WithSenderIdentity(context.Background(), "old", "stale")
+	_, err := al.ProcessDirectWithChannel(parent, "hello", "direct-real", "fluxer", "room", "123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := <-probe.results; got != "true/fluxer/123/fluxer:123" {
+		t.Fatalf("direct sender identity = %q", got)
+	}
+}
+
+func TestSpawnToolPreservesSenderIdentity(t *testing.T) {
+	manager := tools.NewSubagentManager(&identityProvider{}, "test", t.TempDir(), nil)
+	probe := &identityProbe{results: make(chan string, 1)}
+	manager.RegisterTool(probe)
+	ctx := tools.WithSenderIdentity(context.Background(), "fluxer", "123")
+	spawn := tools.NewSpawnTool(manager)
+	completed := make(chan struct{})
+	spawn.SetCallback(func(_ context.Context, _ *tools.ToolResult) { close(completed) })
+	result := spawn.Execute(ctx, map[string]interface{}{"task": "inspect"})
+	if result.IsError {
+		t.Fatalf("spawn failed: %s", result.ForLLM)
+	}
+	select {
+	case got := <-probe.results:
+		if got != "true/fluxer/123/fluxer:123" {
+			t.Fatalf("spawn identity = %q", got)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("spawn did not execute tool")
+	}
+	select {
+	case <-completed:
+	case <-time.After(10 * time.Second):
+		t.Fatal("spawn did not complete")
+	}
+}
+
+func TestSubagentToolPreservesSenderIdentity(t *testing.T) {
+	manager := tools.NewSubagentManager(&identityProvider{}, "test", t.TempDir(), nil)
+	probe := &identityProbe{results: make(chan string, 1)}
+	manager.RegisterTool(probe)
+	ctx := tools.WithSenderIdentity(context.Background(), "fluxer", "123")
+	result := tools.NewSubagentTool(manager).Execute(ctx, map[string]interface{}{"task": "inspect"})
+	if result.IsError {
+		t.Fatalf("subagent failed: %s", result.ForLLM)
+	}
+	if got := <-probe.results; got != "true/fluxer/123/fluxer:123" {
+		t.Fatalf("subagent identity = %q", got)
+	}
+}
+
+type concurrentIdentityProvider struct{}
+
+func (*concurrentIdentityProvider) GetDefaultModel() string { return "test" }
+func (*concurrentIdentityProvider) Chat(_ context.Context, messages []providers.Message, _ []providers.ToolDefinition, _ string, _ map[string]interface{}) (*providers.LLMResponse, error) {
+	for _, m := range messages {
+		if m.Role == "tool" {
+			return &providers.LLMResponse{Content: "done"}, nil
+		}
+	}
+	return &providers.LLMResponse{ToolCalls: []providers.ToolCall{{ID: "1", Name: "identity_probe", Arguments: map[string]interface{}{"sender": messages[1].Content}}}}, nil
+}
+
+type concurrentIdentityProbe struct {
+	entered chan string
+	release <-chan struct{}
+}
+
+func (*concurrentIdentityProbe) Name() string        { return "identity_probe" }
+func (*concurrentIdentityProbe) Description() string { return "Inspect execution identity" }
+func (*concurrentIdentityProbe) Parameters() map[string]interface{} {
+	return map[string]interface{}{"type": "object", "properties": map[string]interface{}{"sender": map[string]interface{}{"type": "string"}}}
+}
+func (p *concurrentIdentityProbe) Execute(ctx context.Context, args map[string]interface{}) *tools.ToolResult {
+	record := func() {
+		id, ok := tools.SenderIdentityFromContext(ctx)
+		p.entered <- fmt.Sprintf("%s:%t/%s/%s", args["sender"], ok, id.Channel, id.RawID)
+	}
+	record()
+	select {
+	case <-p.release:
+	case <-ctx.Done():
+		return tools.ErrorResult("cancelled")
+	}
+	record()
+	return tools.SilentResult("ok")
+}
+
+func TestSpawnSenderIdentityIsolatedAcrossOverlappingTasks(t *testing.T) {
+	manager := tools.NewSubagentManager(&concurrentIdentityProvider{}, "test", t.TempDir(), nil)
+	entered := make(chan string, 4)
+	release := make(chan struct{})
+	manager.RegisterTool(&concurrentIdentityProbe{entered: entered, release: release})
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	done := make(chan *tools.ToolResult, 2)
+	for _, raw := range []string{"one", "two"} {
+		taskCtx := tools.WithSenderIdentity(ctx, "fluxer", raw)
+		_, err := manager.Spawn(taskCtx, raw, raw, "fluxer", "room", func(_ context.Context, result *tools.ToolResult) { done <- result })
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	received := map[string]int{}
+	for i := 0; i < 2; i++ {
+		select {
+		case value := <-entered:
+			received[value]++
+		case <-ctx.Done():
+			t.Fatal("both tasks did not overlap")
+		}
+	}
+	close(release)
+	for i := 0; i < 2; i++ {
+		select {
+		case value := <-entered:
+			received[value]++
+		case <-ctx.Done():
+			t.Fatal("tasks did not finish identity checks")
+		}
+		select {
+		case result := <-done:
+			if result.IsError {
+				t.Fatalf("task failed: %s", result.ForLLM)
+			}
+		case <-ctx.Done():
+			t.Fatal("tasks did not complete")
+		}
+	}
+	if received["one:true/fluxer/one"] != 2 || received["two:true/fluxer/two"] != 2 || len(received) != 2 {
+		t.Fatalf("overlapping identities = %v", received)
+	}
+}

@@ -679,10 +679,20 @@ func (al *AgentLoop) RecordLastChatID(chatID string) error {
 }
 
 func (al *AgentLoop) ProcessDirect(ctx context.Context, content, sessionKey string) (string, error) {
-	return al.ProcessDirectWithChannel(ctx, content, sessionKey, "cli", "direct", "cli")
+	return al.ProcessSyntheticWithChannel(ctx, content, sessionKey, "cli", "direct", "cli")
 }
 
 func (al *AgentLoop) ProcessDirectWithChannel(ctx context.Context, content, sessionKey, channel, chatID, senderID string) (string, error) {
+	return al.processDirectWithChannel(ctx, content, sessionKey, channel, chatID, senderID, false)
+}
+
+// ProcessSyntheticWithChannel preserves routing and profile values without
+// exposing the synthetic sender as an execution identity.
+func (al *AgentLoop) ProcessSyntheticWithChannel(ctx context.Context, content, sessionKey, channel, chatID, senderID string) (string, error) {
+	return al.processDirectWithChannel(ctx, content, sessionKey, channel, chatID, senderID, true)
+}
+
+func (al *AgentLoop) processDirectWithChannel(ctx context.Context, content, sessionKey, channel, chatID, senderID string, synthetic bool) (string, error) {
 	msg := bus.InboundMessage{
 		Channel:    channel,
 		SenderID:   senderID,
@@ -691,12 +701,14 @@ func (al *AgentLoop) ProcessDirectWithChannel(ctx context.Context, content, sess
 		SessionKey: sessionKey,
 	}
 
-	return al.processMessage(ctx, msg)
+	response, _, err := al.processMessageWithClassification(ctx, msg, nil, synthetic)
+	return response, err
 }
 
 // ProcessHeartbeat processes a heartbeat request without session history.
 // Each heartbeat is independent and doesn't accumulate context.
 func (al *AgentLoop) ProcessHeartbeat(ctx context.Context, content, channel, chatID string) (string, error) {
+	ctx = tools.WithSenderIdentity(ctx, "", "")
 	result, err := al.runAgentLoop(ctx, processOptions{
 		SessionKey:      "heartbeat",
 		Channel:         channel,
@@ -721,6 +733,15 @@ func (al *AgentLoop) processMessageWithProgress(ctx context.Context, msg bus.Inb
 }
 
 func (al *AgentLoop) processMessageWithMedia(ctx context.Context, msg bus.InboundMessage, onProgress func(phase, detail string)) (string, []bus.OutboundAttachment, error) {
+	return al.processMessageWithClassification(ctx, msg, onProgress, false)
+}
+
+func (al *AgentLoop) processMessageWithClassification(ctx context.Context, msg bus.InboundMessage, onProgress func(phase, detail string), synthetic bool) (string, []bus.OutboundAttachment, error) {
+	channel, sender := msg.Channel, msg.SenderID
+	if synthetic || channel == "system" || channel == "maixcam" || (channel == "feishu" && sender == "unknown") {
+		channel, sender = "", ""
+	}
+	ctx = tools.WithSenderIdentity(ctx, channel, sender)
 	// Add message preview to log (show full content for error messages)
 	var logContent string
 	if strings.Contains(msg.Content, "Error:") || strings.Contains(msg.Content, "error") {
